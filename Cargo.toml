@@ -1,6 +1,6 @@
 [package]
 name = "zhol"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 
 [features]
@@ -19,4 +19,9 @@ windows-result = "0.3.4"
 [lib]
 name = "zhol"
 path = "src/lib.rs"
-features = ["async"]
+# license = "MIT"
+# keywords = ["memory", "exploit", "winapi", "process"]
+# description = "A Rust library for Windows process manipulation, memory operations, and function hooking."
+# homepage = "https://www.github.com/Slackaduts/zhol"
+# repository = "https://www.github.com/Slackaduts/zhol"
+# publish = true

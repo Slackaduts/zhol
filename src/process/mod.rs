@@ -47,77 +47,6 @@ macro_rules! with_handle {
 use std::sync::Arc;
 use windows::Win32::Foundation::HANDLE;
 
-/// A wrapper around Windows API handles that provides thread-safe storage and conversion.
-/// 
-/// `RawHandle` stores a Windows `HANDLE` as a `usize` value, allowing it to be safely
-/// shared between threads while maintaining the ability to convert back to the original
-/// `HANDLE` type when needed for Windows API calls.
-/// 
-/// This type implements `Send` and `Sync` to allow cross-thread usage, though care
-/// must be taken to ensure the underlying handle remains valid across thread boundaries.
-pub struct RawHandle {
-    /// The handle value stored as a usize for thread-safe storage
-    handle_value: usize,
-}
-
-impl RawHandle {
-    /// Creates a new `RawHandle` from a Windows API handle.
-    /// 
-    /// **This is only intended for library use but has been made available to suit more custom solutions.**
-    pub fn new(handle: windows::Win32::Foundation::HANDLE) -> Self {
-        // Convert HANDLE to its integer representation
-        let handle_value = handle.0 as usize;
-        RawHandle { handle_value }
-    }
-
-    /// Converts the stored handle value back to a Windows API `HANDLE`.
-    /// 
-    /// This is only intended for library use but has been made available to suit more custom solutions.
-    pub fn as_handle(&self) -> windows::Win32::Foundation::HANDLE {
-        windows::Win32::Foundation::HANDLE(self.handle_value as *mut std::ffi::c_void)
-    }
-}
-
-/// # Safety
-/// 
-/// `RawHandle` can be safely sent between threads as it only stores the handle value
-/// as an integer. However, the caller must ensure the underlying Windows handle
-/// remains valid across thread boundaries.
-unsafe impl Send for RawHandle {}
-
-/// # Safety
-/// 
-/// `RawHandle` can be safely shared between threads as it only provides read access
-/// to the stored handle value. The underlying handle value is immutable after creation.
-unsafe impl Sync for RawHandle {}
-
-impl std::ops::Deref for RawHandle { // BAD, rework sometime :) -S
-    type Target = windows::Win32::Foundation::HANDLE;
-
-    /// Provides deref access to the underlying handle using thread-local storage.
-    /// 
-    /// This implementation uses thread-local storage to provide a reference to the handle
-    /// without creating lifetime issues. Each thread gets its own storage for the handle value.
-    /// 
-    /// # Safety
-    /// 
-    /// This implementation uses unsafe code to cast the thread-local storage address.
-    /// The safety relies on the thread-local storage remaining valid for the duration
-    /// of the reference's lifetime within the same thread.
-    fn deref(&self) -> &Self::Target {
-        // We can't return a reference to a temporary handle
-        thread_local! {
-            static HANDLE_STORAGE: std::cell::Cell<windows::Win32::Foundation::HANDLE> =
-                std::cell::Cell::new(windows::Win32::Foundation::HANDLE::default());
-        }
-
-        HANDLE_STORAGE.with(|storage| {
-            storage.set(self.as_handle());
-            unsafe { &*(storage as *const _ as *const windows::Win32::Foundation::HANDLE) }
-        })
-    }
-}
-
 use parking_lot::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -127,12 +56,9 @@ use std::time::Duration;
 /// using a mutex. It supports both blocking and timeout-based acquisition of the handle,
 /// making it suitable for scenarios where handle access needs to be coordinated between
 /// multiple threads or where deadlock prevention is important.
-/// 
-/// The handle is wrapped in an `Arc<RawHandle>` to allow for efficient cloning and
-/// shared ownership while maintaining thread safety.
 pub struct SafeHandle {
     /// The mutex-protected handle wrapped in an Arc for shared ownership
-    inner: Arc<Mutex<Arc<RawHandle>>>,
+    inner: Arc<Mutex<HANDLE>>,
 }
 
 impl Clone for SafeHandle {
@@ -161,7 +87,7 @@ unsafe impl Sync for SafeHandle {}
 /// The guard implements `Deref` to provide direct access to the underlying `HANDLE`.
 pub struct SafeHandleGuard<'a> {
     /// The mutex guard that maintains exclusive access to the handle
-    _guard: MutexGuard<'a, Arc<RawHandle>>,
+    _guard: MutexGuard<'a, HANDLE>,
 }
 
 impl SafeHandle {
@@ -179,9 +105,8 @@ impl SafeHandle {
     /// let safe_handle = SafeHandle::new(some_windows_handle);
     /// ```
     pub fn new(handle: HANDLE) -> Self {
-        let raw_handle = Arc::new(RawHandle::new(handle));
         SafeHandle {
-            inner: Arc::new(Mutex::new(raw_handle)),
+            inner: Arc::new(Mutex::new(handle)),
         }
     }
 
@@ -228,6 +153,6 @@ impl<'a> std::ops::Deref for SafeHandleGuard<'a> {
     /// enabling transparent usage in Windows API calls while maintaining
     /// the safety guarantees of the mutex protection.
     fn deref(&self) -> &Self::Target {
-        &**self._guard
+        &*self._guard
     }
 }
