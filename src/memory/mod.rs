@@ -93,9 +93,10 @@ impl MemOpContext {
 /// Value must implement bytemuck::Pod.
 pub fn read<T: crate::memory::transmute::ZholTyped<T>>(hook: &crate::hooks::ZholHook, context: &MemOpContext) -> MemOpResult<T> {
     let data = hook.data().read();
+    let var_mem_addr = crate::hooks::get_var_mem_addr(&data)?;
     let ptr: usize = match context.at_pointer {
-        true => crate::memory::read::read_value::<i32>(&hook, data.var_mem.addr, context.timeout)? as usize,
-        false => data.var_mem.addr,
+        true => crate::memory::read::read_value::<i32>(&hook, var_mem_addr, context.timeout)? as usize,
+        false => var_mem_addr,
     };
     drop(data);
 
@@ -113,9 +114,10 @@ pub fn write<T: crate::memory::transmute::ZholTyped<T>>(
     context: &MemOpContext,
 ) -> MemOpResult<()> {
     let data = hook.data().read();
+    let var_mem_addr = crate::hooks::get_var_mem_addr(&data)?;
     let ptr: usize = match context.at_pointer {
-        true => crate::memory::read::read_value::<i32>(&hook, data.var_mem.addr, context.timeout)? as usize,
-        false => data.var_mem.addr,
+        true => crate::memory::read::read_value::<i32>(&hook, var_mem_addr, context.timeout)? as usize,
+        false => var_mem_addr,
     };
 
     drop(data);

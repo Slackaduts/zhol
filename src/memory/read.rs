@@ -79,9 +79,10 @@ pub fn read_value<T: ZholTyped<T>>(
 /// Value must implement bytemuck::Pod.
 pub fn read<T: ZholTyped<T>>(hook: &ZholHook, context: &MemOpContext) -> MemOpResult<T> {
     let data = hook.data().read();
+    let var_mem_addr = crate::hooks::get_var_mem_addr(&data)?;
     let ptr: usize = match context.at_pointer {
-        true => read_value::<i32>(&hook, data.var_mem.addr, context.timeout)? as usize,
-        false => data.var_mem.addr,
+        true => read_value::<i32>(&hook, var_mem_addr, context.timeout)? as usize,
+        false => var_mem_addr,
     };
     drop(data);
 

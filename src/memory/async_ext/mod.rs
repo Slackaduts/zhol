@@ -30,9 +30,10 @@ pub async fn read<T: crate::memory::transmute::ZholTyped<T> + Send + Sync>(
     base_opt: Option<usize>,
 ) -> crate::MemOpResult<T> {
     let data = hook.data().read();
+    let var_mem_addr = crate::hooks::get_var_mem_addr(&data)?;
     let base = match base_opt {
         Some(b) => b,
-        None => data.var_mem.addr,
+        None => var_mem_addr,
     };
     let ptr: usize = match context.at_pointer {
         true => crate::memory::async_ext::read::read_value::<i32>(hook, base, context.timeout).await? as usize,
@@ -78,9 +79,10 @@ pub async fn write<T: crate::memory::transmute::ZholTyped<T> + Send + Sync>(
     base_opt: Option<usize>,
 ) -> crate::MemOpResult<()> {
     let data = hook.data().read();
+    let var_mem_addr = crate::hooks::get_var_mem_addr(&data)?;
     let base = match base_opt {
         Some(b) => b,
-        None => data.var_mem.addr,
+        None => var_mem_addr,
     };
     let ptr: usize = match context.at_pointer {
         true => {

@@ -1,3 +1,4 @@
+#[cfg(feature = "aob-injection")]
 use crate::hooks::*;
 
 use anyhow::{anyhow, Result};
@@ -104,13 +105,14 @@ fn apply_nops(
 /// Sets up a `dynasm::Assembler` to a hook's newmem address.
 ///
 /// # Arguments
-/// * `hook`: Hook runtime data
+/// * `aob_data`: AOB hook runtime data
 /// # Returns
 /// * `anyhow::Result<dynasm::Assembler<dynasmrt::x86::X86Relocation>>`: Anyhow result containing the Assembler object
-pub fn newmem_jmp(hook: &HookData) -> Result<Assembler<X86Relocation>> {
+#[cfg(feature = "aob-injection")]
+pub fn newmem_jmp(aob_data: &AobData) -> Result<Assembler<X86Relocation>> {
     let mut ops: Assembler<X86Relocation> = Assembler::new()?;
-    let newmem = hook.hook_mem.addr as i32;
-    let newmem_rel_jmp = newmem - (hook.get_addr()? as i32 + 5);
+    let newmem = aob_data.hook_mem.addr as i32;
+    let newmem_rel_jmp = newmem - (aob_data.get_addr()? as i32 + 5);
 
     dynasm!(ops
         ; .arch x86
@@ -124,23 +126,24 @@ pub fn newmem_jmp(hook: &HookData) -> Result<Assembler<X86Relocation>> {
 ///
 /// # Arguments
 /// * `ops`: Assembler object to append the jump instruction to
-/// * `hook_data`: Hook runtime data
-/// * 'hook_impl': Hook impl to use, supplies hook-specific compiletime data
+/// * `aob_data`: AOB hook runtime data
+/// * 'aob_impl': AOB exploit impl to use, supplies hook-specific compiletime data
 /// * `target`: The address to jump to
 /// # Returns
 /// * `anyhow::Result<()>`: Anyhow result indicating success or failure
+#[cfg(feature = "aob-injection")]
 pub fn end_jmp(
     ops: &mut Assembler<X86Relocation>,
     nops: Option<usize>,
-    hook_data: &HookData,
-    hook_impl: &dyn HookImpl,
+    aob_data: &AobData,
+    aob_impl: &dyn AobExploitImpl,
     target: usize,
 ) -> Result<()> {
     let rel_return = calc_rel_inst(
         &ops,
-        hook_data.hook_mem.addr as usize,
+        aob_data.hook_mem.addr as usize,
         target,
-        hook_data.get_jmp_size(hook_impl)?,
+        aob_data.get_jmp_size(aob_impl)?,
     );
     dynasm!(ops
         ; jmp rel_return

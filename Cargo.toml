@@ -5,7 +5,8 @@ edition = "2024"
 
 [features]
 async = ["smol"]
-default = ["async"]
+aob-injection = []
+default = ["async", "aob-injection"]
 
 [dependencies]
 anyhow = "1.0.99"
