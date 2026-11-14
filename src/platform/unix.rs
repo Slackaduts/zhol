@@ -242,10 +242,20 @@ pub fn query_region(
             });
         }
     }
-    // Not mapped: report an uncommitted, inaccessible region at the address.
+    // Not mapped: report an uncommitted region spanning the gap up to the next
+    // mapping, so a region-walking scanner advances past the hole instead of
+    // stalling on a zero-size region. If nothing lies above, span to the top of
+    // user address space so the walk terminates.
+    const USER_TOP: u64 = 0x7FFF_FFFF_0000;
+    let next = regions
+        .iter()
+        .map(|r| r.start)
+        .filter(|&s| s > addr as u64)
+        .min()
+        .unwrap_or(USER_TOP);
     Ok(Region {
         base: addr,
-        size: 0,
+        size: next.saturating_sub(addr as u64) as usize,
         readable: false,
         writable: false,
         executable: false,
