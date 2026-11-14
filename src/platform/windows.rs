@@ -268,3 +268,9 @@ pub fn protect(
     }
     Ok(Protect(old.0))
 }
+
+/// No-op on Windows: remote allocation uses `VirtualAllocEx`, so there is no
+/// cave to register. Present for cross-platform signature parity.
+pub fn register_cave(_handle: &SafeHandle, _start: usize, _size: usize) -> MemOpResult<()> {
+    Ok(())
+}

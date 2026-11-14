@@ -6,10 +6,14 @@
 //! `FOLL_FORCE` path lets a same-uid writer patch even read-only/executable
 //! pages without `ptrace`, which is what hook installation needs.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::os::unix::fs::FileExt;
+use std::sync::OnceLock;
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use anyhow::anyhow;
 
@@ -250,16 +254,170 @@ pub fn query_region(
     })
 }
 
-/// Remote allocation has no portable `/proc` equivalent. The hook engine's Unix
-/// path will carve scratch space from in-module section padding (code caves)
-/// instead; until that lands, this is a clear error rather than a silent stub.
-pub fn alloc(_handle: &SafeHandle, _size: usize) -> MemOpResult<usize> {
-    Err(MemOpError::Other(anyhow!(
-        "zhol: remote allocation is not yet implemented on Unix; \
-         hook installation requires the code-cave allocator (pending)"
-    )))
+/// Smallest trailing-padding run worth treating as a usable cave.
+const MIN_CAVE: u64 = 0x400;
+
+/// A bump allocator over one run of executable-section padding in the target.
+struct Cave {
+    next: u64,
+    end: u64,
 }
 
+/// Per-pid caves. Unix has no `VirtualAllocEx`: scratch for hook code and hook
+/// variables is carved from the zero padding at the end of the main module's
+/// executable sections. That padding lives inside the module, so it is always
+/// within rel32 reach of the code being hooked (what `newmem_jmp` needs) and
+/// needs no `ptrace`. The allocator bumps and never reclaims; `free` is a no-op
+/// because a long-lived hook holds its memory for the process lifetime (and
+/// `MemoryRegion` is `Clone`, so reclaiming on drop would be unsafe).
+static CAVES: OnceLock<Mutex<HashMap<u32, Cave>>> = OnceLock::new();
+
+fn caves() -> &'static Mutex<HashMap<u32, Cave>> {
+    CAVES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn read_u16_at(mem: &File, addr: u64) -> Option<u16> {
+    let mut b = [0u8; 2];
+    mem.read_exact_at(&mut b, addr).ok()?;
+    Some(u16::from_le_bytes(b))
+}
+
+fn read_u32_at(mem: &File, addr: u64) -> Option<u32> {
+    let mut b = [0u8; 4];
+    mem.read_exact_at(&mut b, addr).ok()?;
+    Some(u32::from_le_bytes(b))
+}
+
+/// Read `[addr, addr+size)` tolerating unmapped holes (zero-filled).
+fn gather(mem: &File, regions: &[MapRegion], addr: u64, size: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; size];
+    let end = addr + size as u64;
+    for r in regions {
+        if !r.readable || r.end <= addr || r.start >= end {
+            continue;
+        }
+        let from = r.start.max(addr);
+        let to = r.end.min(end);
+        let at = (from - addr) as usize;
+        let len = (to - from) as usize;
+        let _ = mem.read_exact_at(&mut buf[at..at + len], from);
+    }
+    buf
+}
+
+/// Find the largest run of trailing zero padding across the executable sections
+/// of the main `.exe` module, by parsing the PE section table from memory
+/// (robust under Wine, where sections are anonymous rather than file-backed).
+fn find_exe_cave(target: &Target) -> MemOpResult<Cave> {
+    let regions = read_maps(target.pid)?;
+    let base = regions
+        .iter()
+        .filter(|r| basename(&r.path).to_lowercase().ends_with(".exe"))
+        .map(|r| r.start)
+        .min()
+        .ok_or_else(|| MemOpError::Other(anyhow!("no .exe module mapped in target")))?;
+    let mem = &target.mem;
+
+    let lfanew = read_u32_at(mem, base + 0x3C)
+        .ok_or_else(|| MemOpError::Other(anyhow!("cannot read e_lfanew")))? as u64;
+    let mut sig = [0u8; 4];
+    mem.read_exact_at(&mut sig, base + lfanew)
+        .map_err(|e| MemOpError::Os((format!("read PE sig: {e}"), None)))?;
+    if &sig != b"PE\0\0" {
+        return Err(MemOpError::Other(anyhow!("main module is not a PE")));
+    }
+    let num_sections = read_u16_at(mem, base + lfanew + 6)
+        .ok_or_else(|| MemOpError::Other(anyhow!("cannot read NumberOfSections")))?;
+    let opt_hdr_size = read_u16_at(mem, base + lfanew + 20)
+        .ok_or_else(|| MemOpError::Other(anyhow!("cannot read SizeOfOptionalHeader")))?;
+    let sec_table = base + lfanew + 24 + opt_hdr_size as u64;
+
+    const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+
+    // Collect (vaddr, vsize, executable) for every section, then sort by vaddr
+    // so each section's true end-in-memory is the next section's start. The cave
+    // lives in the zero padding from the last real byte of code to that end,
+    // which spans both intra-section slack and the alignment gap before the next
+    // section -- the padding a `maps`-only view would also see.
+    let mut secs: Vec<(u64, u64, bool)> = Vec::new();
+    for i in 0..num_sections as u64 {
+        let sh = sec_table + i * 40;
+        let vsize = read_u32_at(mem, sh + 8).unwrap_or(0) as u64;
+        let vaddr = read_u32_at(mem, sh + 12).unwrap_or(0) as u64;
+        let chars = read_u32_at(mem, sh + 36).unwrap_or(0);
+        if vsize == 0 {
+            continue;
+        }
+        secs.push((vaddr, vsize, chars & IMAGE_SCN_MEM_EXECUTE != 0));
+    }
+    secs.sort_by_key(|s| s.0);
+
+    let mut best: Option<(u64, u64)> = None; // (pad_start, span_end)
+    for (idx, &(vaddr, vsize, execf)) in secs.iter().enumerate() {
+        if !execf {
+            continue;
+        }
+        let sec_start = base + vaddr;
+        let content_end = sec_start + vsize;
+        // End of this section's mapped span: next section start, else image end.
+        let span_end = match secs.get(idx + 1) {
+            Some(&(next_vaddr, _, _)) => base + next_vaddr,
+            None => content_end, // last section: only intra-section slack
+        };
+        // Find the last non-zero byte within the whole span.
+        let span_len = (span_end - sec_start) as usize;
+        let data = gather(mem, &regions, sec_start, span_len);
+        let last_nonzero = data.iter().rposition(|&b| b != 0);
+        let pad_start = match last_nonzero {
+            Some(i) => sec_start + i as u64 + 1,
+            None => sec_start,
+        };
+        let run = span_end - pad_start;
+        if run >= MIN_CAVE && best.map_or(true, |(s, e)| (e - s) < run) {
+            best = Some((pad_start, span_end));
+        }
+    }
+
+    let (start, end) = best.ok_or_else(|| {
+        MemOpError::Other(anyhow!(
+            "no executable-section padding >= {MIN_CAVE:#x} bytes found for a code cave"
+        ))
+    })?;
+    Ok(Cave { next: start, end })
+}
+
+/// Allocate `size` bytes of in-module scratch from the target's code cave.
+pub fn alloc(handle: &SafeHandle, size: usize) -> MemOpResult<usize> {
+    let guard = acquire(handle, Some(Duration::from_secs(2)))?;
+    let pid = guard.pid;
+    let mut map = caves().lock();
+    if !map.contains_key(&pid) {
+        let cave = find_exe_cave(&guard)?;
+        map.insert(pid, cave);
+    }
+    let cave = map.get_mut(&pid).unwrap();
+
+    // 16-byte align so code and variable blocks are naturally aligned.
+    let addr = (cave.next + 15) & !15;
+    if addr + size as u64 > cave.end {
+        return Err(MemOpError::Other(anyhow!(
+            "code cave exhausted: {} bytes left, {} wanted",
+            cave.end.saturating_sub(addr),
+            size
+        )));
+    }
+    cave.next = addr + size as u64;
+
+    guard
+        .mem
+        .write_all_at(&vec![0u8; size], addr)
+        .map_err(|e| MemOpError::Os((format!("zero cave @ {addr:#x}: {e}"), None)))?;
+
+    Ok(addr as usize)
+}
+
+/// No-op: cave space is not reclaimed (hooks are long-lived and `MemoryRegion`
+/// is `Clone`, so zeroing on drop could clobber live scratch).
 pub fn free(_handle: &SafeHandle, _addr: usize, _size: usize) -> MemOpResult<()> {
     Ok(())
 }
@@ -274,4 +432,21 @@ pub fn protect(
     prot: Protect,
 ) -> MemOpResult<Protect> {
     Ok(prot)
+}
+
+/// Register an explicit code-cave arena for a target, overriding the
+/// auto-discovered one. Games with a tightly-packed `.text` (Wizard101 among
+/// them) expose a larger reusable region elsewhere — wizwalker's "autobot",
+/// found by pattern scan — that the caller can hand in here so hook allocation
+/// draws from it instead of the small section padding.
+pub fn register_cave(handle: &SafeHandle, start: usize, size: usize) -> MemOpResult<()> {
+    let guard = acquire(handle, Some(Duration::from_secs(2)))?;
+    caves().lock().insert(
+        guard.pid,
+        Cave {
+            next: start as u64,
+            end: (start + size) as u64,
+        },
+    );
+    Ok(())
 }
