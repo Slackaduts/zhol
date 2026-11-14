@@ -750,6 +750,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "dynasmrt",
+ "libc",
  "parking_lot",
  "smol",
  "windows",

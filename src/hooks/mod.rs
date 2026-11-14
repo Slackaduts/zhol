@@ -8,14 +8,14 @@ use crate::memory::{
     read::read_bytes, utils::change_memory_protection, write::write_bytes, Byte, MemOpContext,
     MemoryRegion,
 };
-use crate::process::module::{get_module_info, module_by_name};
+use crate::platform::Protect;
+use crate::process::module::module_by_name;
 use crate::process::pattern::{create_unhook_bytes, find_pattern_in_bytes};
 use crate::process::SafeHandle;
 
 use anyhow::{anyhow, Result};
 use std::time::Duration;
 
-use windows::Win32::System::{Memory::PAGE_READWRITE, ProcessStatus::MODULEINFO};
 
 pub type ZholHook = std::sync::Arc<dyn HookOps>;
 
@@ -76,7 +76,7 @@ impl Hook {
         let maybe_module = module_by_name(&handle, hook_impl.module_name(), true, None)?;
         let module = maybe_module.ok_or(anyhow!("Could not get module Zhol.exe."))?;
         let data = HookData {
-            module_addr: module.0 as usize,
+            module_addr: module.base,
             hook_mem: allocate_memory(&handle, hook_impl.hook_alloc_size())?,
             var_mem: allocate_memory(&handle, hook_impl.var_size())?,
             pattern: hook_impl.pattern().to_vec(),
@@ -158,21 +158,15 @@ impl HookOps for Hook {
             }
         };
 
-        let module_info: MODULEINFO = get_module_info(&self.handle, module, None)?;
         change_memory_protection(
             &self.handle,
-            module.0 as usize,
-            module_info.SizeOfImage as usize,
+            module.base,
+            module.size,
             None,
-            PAGE_READWRITE,
+            Protect::EXEC_RW,
         )?;
 
-        let bytes = read_bytes(
-            &self.handle,
-            module.0 as usize,
-            module_info.SizeOfImage as usize,
-            None,
-        )?;
+        let bytes = read_bytes(&self.handle, module.base, module.size, None)?;
 
         let matches = find_pattern_in_bytes(bytes, self.data.read().pattern.clone())?;
 
@@ -180,7 +174,7 @@ impl HookOps for Hook {
         {
             let mut data = self.data.write();
             (data.addr, data.found_bytes) = match matches.first() {
-                Some((a, b)) => (Some(module.0 as usize + a.to_owned()), Some(b.to_owned())),
+                Some((a, b)) => (Some(module.base + a.to_owned()), Some(b.to_owned())),
                 None => return MemOpResult::Err(MemOpError::PatternNotFound),
             };
         }

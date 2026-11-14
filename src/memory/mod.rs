@@ -5,22 +5,16 @@ pub mod transmute;
 pub mod utils;
 pub mod write;
 
-use crate::error::IntoMemOpResult;
-use crate::memory::utils::allocate_memory;
-use core::ffi::c_void;
-
-use crate::process::SafeHandle;
-use crate::{with_handle, MemOpResult};
-
 use std::time::Duration;
 
-use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-use windows::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+use crate::memory::utils::allocate_memory;
+use crate::platform;
+use crate::process::SafeHandle;
+use crate::MemOpResult;
 
 pub type Byte = Option<u8>;
 
-/// Manages a region of memory allocated in a remote process.
-/// The memory is automatically freed when the `MemoryRegion` is dropped.
+/// A region of scratch memory allocated in the target. Freed on drop.
 #[derive(Clone)]
 pub struct MemoryRegion {
     pub handle: SafeHandle,
@@ -33,25 +27,10 @@ impl MemoryRegion {
         allocate_memory(&handle, size)
     }
 
-    /// Zeroes out the memory region. Useful for "resetting" memory to the state prior to allocation.
+    /// Zero the region (reset to a clean state).
     pub fn zero(&self) -> MemOpResult<()> {
-        let buffer = vec![0u8; self.size]; // Create a buffer of zeros with the desired size
-        let mut bytes_written = 0;
-
-        with_handle!(&self.handle, Some(Duration::from_secs(1)), |guard| -> (), {
-            unsafe {
-                WriteProcessMemory(
-                    *guard,
-                    self.addr as *mut c_void,
-                    buffer.as_ptr() as *const _,
-                    self.size,
-                    Some(&mut bytes_written),
-                ).into_memop_result(Some(anyhow::anyhow!("WriteProcessMemory in MemoryRegion::zero()")))?;
-            };
-
-            Ok(())
-        })?;
-
+        let buffer = vec![0u8; self.size];
+        platform::write_mem(&self.handle, self.addr, &buffer, Some(Duration::from_secs(1)))?;
         Ok(())
     }
 }
@@ -61,13 +40,11 @@ unsafe impl Sync for MemoryRegion {}
 
 impl Drop for MemoryRegion {
     fn drop(&mut self) {
-        _ = unsafe { VirtualFree(self.addr as *mut c_void, self.size, MEM_RELEASE) };
+        let _ = platform::free(&self.handle, self.addr, self.size);
     }
 }
 
-/// Context for memory operations.
-/// 
-/// This struct is used to encapsulate the parameters needed for various memory operations.
+/// Parameters for a memory operation originating from a hook's var memory.
 pub struct MemOpContext {
     pub addr: usize,
     pub offset: usize,
@@ -86,27 +63,25 @@ impl MemOpContext {
     }
 }
 
-
-/// Top-level read function.
-///
-/// Use this for reading values directly out of memory.
-/// Value must implement bytemuck::Pod.
-pub fn read<T: crate::memory::transmute::ZholTyped<T>>(hook: &crate::hooks::ZholHook, context: &MemOpContext) -> MemOpResult<T> {
+/// Top-level read: resolves the hook's var pointer, then reads `T` at `+offset`.
+pub fn read<T: crate::memory::transmute::ZholTyped<T>>(
+    hook: &crate::hooks::ZholHook,
+    context: &MemOpContext,
+) -> MemOpResult<T> {
     let data = hook.data().read();
     let ptr: usize = match context.at_pointer {
-        true => crate::memory::read::read_value::<i32>(&hook, data.var_mem.addr, context.timeout)? as usize,
+        true => {
+            crate::memory::read::read_value::<i32>(hook, data.var_mem.addr, context.timeout)?
+                as usize
+        }
         false => data.var_mem.addr,
     };
     drop(data);
 
-    crate::memory::read::read_value::<T>(&hook, ptr + context.offset, context.timeout)
+    crate::memory::read::read_value::<T>(hook, ptr + context.offset, context.timeout)
 }
 
-
-/// Top-level write function.
-///
-/// Use this for writing types directly to memory.
-/// Value must implement bytemuck::Pod.
+/// Top-level write: resolves the hook's var pointer, then writes `T` at `+offset`.
 pub fn write<T: crate::memory::transmute::ZholTyped<T>>(
     hook: &crate::hooks::ZholHook,
     value: T,
@@ -114,11 +89,13 @@ pub fn write<T: crate::memory::transmute::ZholTyped<T>>(
 ) -> MemOpResult<()> {
     let data = hook.data().read();
     let ptr: usize = match context.at_pointer {
-        true => crate::memory::read::read_value::<i32>(&hook, data.var_mem.addr, context.timeout)? as usize,
+        true => {
+            crate::memory::read::read_value::<i32>(hook, data.var_mem.addr, context.timeout)?
+                as usize
+        }
         false => data.var_mem.addr,
     };
-
     drop(data);
 
-    crate::memory::write::write_value::<T>(&hook, ptr + context.offset, value, context.timeout)
+    crate::memory::write::write_value::<T>(hook, ptr + context.offset, value, context.timeout)
 }

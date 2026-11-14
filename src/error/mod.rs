@@ -6,40 +6,24 @@ use std::{
     time::Duration,
 };
 
-use windows::Win32::System::{
-    // Diagnostics::Debug,
-    Memory::{PAGE_PROTECTION_FLAGS, PAGE_TYPE, VIRTUAL_ALLOCATION_TYPE},
-};
-use windows_result::HRESULT;
-
-pub const INVALID_ALLOCATION_TYPE: u8 = 0b001;
-pub const INVALID_PROTECTION_FLAGS: u8 = 0b010;
-pub const INVALID_PAGE_TYPE: u8 = 0b100;
-
-/// Represents errors that can occur during a given memory operation
+/// Represents errors that can occur during a given memory operation.
 #[derive(Debug)]
 pub enum MemOpError {
-    /// Operation timed out
+    /// Operation timed out.
     TimeoutReached((Option<Duration>, Option<anyhow::Error>)),
-    /// Memory is in an invalid state for the requested operation
-    MemoryStateInvalid(
-        (
-            VIRTUAL_ALLOCATION_TYPE,
-            PAGE_PROTECTION_FLAGS,
-            PAGE_TYPE,
-            u8, // Bitflag telling which mem states were wrong
-            Option<anyhow::Error>,
-        ),
-    ),
+    /// Memory is in an invalid state for the requested operation. Carries a
+    /// human description of what was wrong (platform-neutral).
+    MemoryStateInvalid((String, Option<anyhow::Error>)),
+    /// A requested pattern was not found.
     PatternNotFound,
-    /// WinAPI errors
-    WinAPI((windows_result::Error, Option<anyhow::Error>)),
-    /// Generic error that wraps an anyhow::Error
+    /// An OS-level error (Win32 on Windows, errno/`/proc` on Unix).
+    Os((String, Option<anyhow::Error>)),
+    /// Generic error that wraps an `anyhow::Error`.
     Other(anyhow::Error),
 }
 
 impl MemOpError {
-    /// Creates a new `MemOpError::Other` from anything that implements `std::error::Error`
+    /// Creates a new `MemOpError::Other` from anything implementing `std::error::Error`.
     pub fn new<E>(error: E) -> Self
     where
         E: std::error::Error + Send + Sync + 'static,
@@ -47,13 +31,10 @@ impl MemOpError {
         MemOpError::Other(anyhow::Error::new(error))
     }
 
-    /// Convert a boxed error into a MemOpError
     pub fn from_boxed(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
-        let anyhow_err = anyhow::anyhow!("{}", err);
-        MemOpError::Other(anyhow_err)
+        MemOpError::Other(anyhow::anyhow!("{}", err))
     }
 
-    /// Returns the inner anyhow::Error if this is an `Other` variant
     pub fn into_inner(self) -> Option<anyhow::Error> {
         match self {
             MemOpError::Other(err) => Some(err),
@@ -61,82 +42,43 @@ impl MemOpError {
         }
     }
 
-    /// Returns true if this is a `TimeoutReached` error
     pub fn is_timeout(&self) -> bool {
         matches!(self, MemOpError::TimeoutReached(_))
     }
 
-    /// Returns true if this is a `MemoryStateInvalid` error
     pub fn is_memory_state_invalid(&self) -> bool {
         matches!(self, MemOpError::MemoryStateInvalid(_))
     }
 
-    /// Returns true if this is a `WinAPI` error
-    pub fn is_winapi(&self) -> bool {
-        matches!(self, MemOpError::WinAPI(_))
+    /// True for an OS-level error.
+    pub fn is_os(&self) -> bool {
+        matches!(self, MemOpError::Os(_))
     }
 
-    /// Converts this error to its underlying root cause string
     pub fn root_cause_string(&self) -> String {
         match self {
-            MemOpError::TimeoutReached((timeout, err)) => {
-                // let mut root_cause = String::new();
-                match (timeout, err) {
-                    (Some(t), Some(e)) => {
-                        format!("Timeout operation of context \"{e}\" failed to complete within timeout \"{:#?}\".", t)
-                    }
-                    (Some(t), None) => {
-                        format!(
-                            "Timeout operation failed to complete within timeout \"{:#?}\".",
-                            t
-                        )
-                    }
-                    (None, None) => {
-                        "Timeout operation failed to complete within timeout.".to_string()
-                    }
-                    (None, Some(e)) => {
-                        format!("Timeout operation of context \"{e}\" failed to complete with its timeout.")
-                    }
+            MemOpError::TimeoutReached((timeout, err)) => match (timeout, err) {
+                (Some(t), Some(e)) => format!(
+                    "Timeout operation of context \"{e}\" failed to complete within timeout \"{:#?}\".",
+                    t
+                ),
+                (Some(t), None) => {
+                    format!("Timeout operation failed to complete within timeout \"{:#?}\".", t)
                 }
-            }
-            MemOpError::MemoryStateInvalid((state_flag, prot_flag, type_flag, mem_flag, err)) => {
-                let mut bad_attrs: Vec<Box<dyn fmt::Debug>> = Vec::new();
-
-                if mem_flag & INVALID_ALLOCATION_TYPE != 0 {
-                    bad_attrs.push(Box::new(state_flag));
-                }
-
-                if mem_flag & INVALID_PROTECTION_FLAGS != 0 {
-                    bad_attrs.push(Box::new(prot_flag));
-                }
-
-                if mem_flag & INVALID_PAGE_TYPE != 0 {
-                    bad_attrs.push(Box::new(type_flag));
-                }
-
-                let mut attr_err = String::new();
-                for (i, attr) in bad_attrs.iter().enumerate() {
-                    attr_err.push_str(&format!("{:#?}", attr));
-                    if i != (bad_attrs.len() - 1) && bad_attrs.len() != 0 {
-                        attr_err.push_str(", ");
-                    }
-                }
-
-                match err {
-                    Some(e) => format!("Memory operation of context \"{e}\" failed with following invalid states: \"{attr_err}\""),
-                    None => format!("Memory operation failed with the following invalid states: \"{attr_err}\"")
-                }
-            }
-            MemOpError::WinAPI((api_err, err)) => {
-                let api_res: HRESULT = api_err.code();
-                let code = api_res.0;
-                // let code: i32 = 1;
-                match err {
-                    Some(e) => format!("Windows API call with context \"{e}\" failed with: \"Windows Error: {:08X} - {}\"", code, api_err),
-                    None => format!("Windows API call failed with: \"Windows Error: {:08X} - {}\"", code, api_err)
-                }
-            }
-            MemOpError::PatternNotFound => format!("Pattern not found"),
+                (None, None) => "Timeout operation failed to complete within timeout.".to_string(),
+                (None, Some(e)) => format!(
+                    "Timeout operation of context \"{e}\" failed to complete with its timeout."
+                ),
+            },
+            MemOpError::MemoryStateInvalid((desc, err)) => match err {
+                Some(e) => format!("Memory operation of context \"{e}\" failed: {desc}"),
+                None => format!("Memory operation failed: {desc}"),
+            },
+            MemOpError::Os((msg, err)) => match err {
+                Some(e) => format!("OS call with context \"{e}\" failed: \"{msg}\""),
+                None => format!("OS call failed: \"{msg}\""),
+            },
+            MemOpError::PatternNotFound => "Pattern not found".to_string(),
             MemOpError::Other(err) => format!("{:#}", err),
         }
     }
@@ -157,14 +99,12 @@ impl std::error::Error for MemOpError {
     }
 }
 
-// From implementations for better interoperability with anyhow
 impl From<anyhow::Error> for MemOpError {
     fn from(err: anyhow::Error) -> Self {
         MemOpError::Other(err)
     }
 }
 
-// Implement From for common standard library errors
 impl From<std::io::Error> for MemOpError {
     fn from(err: std::io::Error) -> Self {
         MemOpError::Other(anyhow::Error::new(err))
@@ -189,40 +129,33 @@ impl From<std::string::FromUtf8Error> for MemOpError {
     }
 }
 
-// Create a Result type alias with methods similar to anyhow::Result
 pub type MemOpResult<T> = Result<T, MemOpError>;
 
-/// Extension trait to add anyhow-like methods to MemOpResult
+/// Extension trait to add anyhow-like methods to `MemOpResult`.
 pub trait MemOpResultExt<T> {
-    /// Add context to an error
     fn context<C>(self, context: C) -> MemOpResult<T>
     where
         C: fmt::Display + Send + Sync + 'static;
 
-    /// Add context to an error with a lazy closure
     fn with_context<C, F>(self, f: F) -> MemOpResult<T>
     where
         C: fmt::Display + Send + Sync + 'static,
         F: FnOnce() -> C;
 
-    /// Similar to unwrap but maps to a custom error
     fn ok_or_else<E, F>(self, err: F) -> MemOpResult<T>
     where
         E: std::error::Error + Send + Sync + 'static,
         F: FnOnce() -> E;
 
-    /// Chain an operation that returns a Result after this one
     fn and_then<U, F>(self, op: F) -> MemOpResult<U>
     where
         F: FnOnce(T) -> MemOpResult<U>;
 
-    /// Convert an Option to a MemOpResult with custom error
     fn ok_or<E>(self, err: E) -> MemOpResult<T>
     where
         Self: Sized,
         E: Into<MemOpError>;
 
-    /// Map the success value of a result
     fn map_ok<U, F>(self, op: F) -> MemOpResult<U>
     where
         F: FnOnce(T) -> U;
@@ -237,8 +170,7 @@ impl<T> MemOpResultExt<T> for MemOpResult<T> {
             if let MemOpError::Other(inner) = err {
                 MemOpError::Other(inner.context(context))
             } else {
-                let new_err = anyhow::anyhow!("{}: {}", context, err);
-                MemOpError::Other(new_err)
+                MemOpError::Other(anyhow::anyhow!("{}: {}", context, err))
             }
         })
     }
@@ -252,8 +184,7 @@ impl<T> MemOpResultExt<T> for MemOpResult<T> {
             if let MemOpError::Other(inner) = err {
                 MemOpError::Other(inner.context(f()))
             } else {
-                let new_err = anyhow::anyhow!("{}: {}", f(), err);
-                MemOpError::Other(new_err)
+                MemOpError::Other(anyhow::anyhow!("{}: {}", f(), err))
             }
         })
     }
@@ -301,7 +232,6 @@ impl<T> MemOpResultExt<T> for MemOpResult<T> {
     }
 }
 
-// Allow macro-based error creation, similar to anyhow::anyhow!
 #[macro_export]
 macro_rules! memop_err {
     ($msg:literal $(,)?) => {
@@ -315,7 +245,6 @@ macro_rules! memop_err {
     };
 }
 
-// Extension trait implementation for Option<T>
 impl<T> MemOpResultExt<T> for Option<T> {
     fn context<C>(self, context: C) -> MemOpResult<T>
     where
@@ -375,13 +304,10 @@ impl<T> MemOpResultExt<T> for Option<T> {
     }
 }
 
-// Extension trait to add conversion methods for standard Results
 pub trait IntoMemOpResult<T, E> {
-    /// Convert a standard Result into a MemOpResult
     fn into_memop_result(self, ctx: Option<anyhow::Error>) -> MemOpResult<T>;
 }
 
-// Implementation for standard Result where the error implements std::error::Error
 impl<T, E> IntoMemOpResult<T, E> for Result<T, E>
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -393,13 +319,11 @@ where
         }
     }
 }
-// Extension trait for anyhow::Result to convert to MemOpResult
+
 pub trait FromAnyhow<T> {
-    /// Convert an anyhow::Result into a MemOpResult
     fn into_memop_result(self) -> MemOpResult<T>;
 }
 
-// Implementation for anyhow::Result
 impl<T> FromAnyhow<T> for anyhow::Result<T> {
     fn into_memop_result(self) -> MemOpResult<T> {
         match self {
@@ -409,32 +333,7 @@ impl<T> FromAnyhow<T> for anyhow::Result<T> {
     }
 }
 
-// First, implement From for the error type
-impl From<windows_result::Error> for MemOpError {
-    fn from(err: windows_result::Error) -> Self {
-        MemOpError::WinAPI((err, None))
-    }
-}
-
-// Create a specialized trait for windows_result::Result
-pub trait FromWindowsResult<T> {
-    fn into_memop_result(self, ctx: Option<MemOpError>) -> MemOpResult<T>;
-}
-
-// Implement the trait for windows_result::Result
-impl<T> FromWindowsResult<T> for windows_result::Result<T> {
-    fn into_memop_result(self, ctx: Option<MemOpError>) -> MemOpResult<T> {
-        match self {
-            Ok(value) => Ok(value),
-            Err(err) => match ctx {
-                Some(c) => Err(c),
-                None => Err(MemOpError::new(err)),
-            },
-        }
-    }
-}
-
-/// Trait for errors that we don't care about matching down further based on context. This will use Memop::Other().
+/// Trait for errors we don't care to match on further; folds into `Other`.
 pub trait GenericError: Send + Sync + Clone + PartialEq + Eq + std::fmt::Debug {}
 impl GenericError for ParseIntError {}
 impl GenericError for ParseBoolError {}
@@ -446,6 +345,3 @@ impl<T: GenericError> From<T> for MemOpError {
         memop_err!("{:#?}", err)
     }
 }
-
-// #[cfg(feature = "async")]
-// impl GenericError for tokio::task::JoinError {}

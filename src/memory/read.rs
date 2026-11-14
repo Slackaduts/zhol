@@ -1,50 +1,30 @@
-use crate::error::IntoMemOpResult;
-use crate::hooks::ZholHook;
-use crate::memory::utils::wait_for_safe_mem;
-use crate::process::SafeHandle;
-use crate::with_handle;
-use crate::MemOpResult;
+//! Reads from target memory, via the platform backend.
+
+use std::any::type_name;
+use std::time::Duration;
 
 use anyhow::anyhow;
-use std::time::Duration;
-use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+
+use crate::hooks::ZholHook;
+use crate::memory::utils::wait_for_safe_mem;
+use crate::platform;
+use crate::process::SafeHandle;
+use crate::MemOpResult;
 
 use super::transmute::ZholTyped;
 use super::MemOpContext;
 
-use std::any::type_name;
-
+/// Read `size` raw bytes from `addr`.
 pub fn read_bytes(
     handle: &SafeHandle,
     addr: usize,
     size: usize,
     timeout: Option<Duration>,
 ) -> MemOpResult<Vec<u8>> {
-    let mut buffer = vec![0u8; size];
-    let mut bytes_read = 0;
-
-    wait_for_safe_mem(&handle.clone(), addr, timeout, false)?;
-    with_handle!(&handle.clone(), timeout, |guard| -> (), {
-        unsafe {
-            ReadProcessMemory(
-                *guard,
-                addr as *const _,
-                buffer.as_mut_ptr() as *mut _,
-                size,
-                Some(&mut bytes_read),
-            ).into_memop_result(Some(anyhow!("ReadProcessMemory in read_bytes()")))?;
-
-            std::thread::sleep(Duration::from_nanos(1));
-
-            Ok(())
-        }
-    })?;
-
-    wait_for_safe_mem(&handle.clone(), addr, timeout, false)?;
-
-    buffer.truncate(bytes_read);
-
-    Ok(buffer)
+    // Best-effort readiness wait; the platform read itself is authoritative and
+    // (on Unix) tolerates holes within the range.
+    let _ = wait_for_safe_mem(handle, addr, timeout, false);
+    platform::read_mem(handle, addr, size, timeout)
 }
 
 pub fn read_value<T: ZholTyped<T>>(
@@ -52,13 +32,10 @@ pub fn read_value<T: ZholTyped<T>>(
     address: usize,
     timeout: Option<Duration>,
 ) -> MemOpResult<T> {
-    // Calculate size needed for the type
     let size = std::mem::size_of::<T>();
     let raw_buffer: Vec<u8> = read_bytes(&hook.handle(), address, size, timeout)?;
-
     let context = MemOpContext::new(address, 0x0, false, timeout);
 
-    // let value = T::transmute_from(&raw_buffer)?;
     let value = match T::transmute_from(&raw_buffer, hook, &context)? {
         Some(a) => a,
         None => {
@@ -73,30 +50,26 @@ pub fn read_value<T: ZholTyped<T>>(
     Ok(value)
 }
 
-/// Top-level read function.
-///
-/// Use this for reading values directly out of game memory.
-/// Value must implement bytemuck::Pod.
+/// Top-level read: resolves the hook's var pointer, then reads `T` at `+offset`.
 pub fn read<T: ZholTyped<T>>(hook: &ZholHook, context: &MemOpContext) -> MemOpResult<T> {
     let data = hook.data().read();
     let ptr: usize = match context.at_pointer {
-        true => read_value::<i32>(&hook, data.var_mem.addr, context.timeout)? as usize,
+        true => read_value::<i32>(hook, data.var_mem.addr, context.timeout)? as usize,
         false => data.var_mem.addr,
     };
     drop(data);
 
-    read_value::<T>(&hook, ptr + context.offset, context.timeout)
+    read_value::<T>(hook, ptr + context.offset, context.timeout)
 }
 
+/// Read a KingsIsle-style wide string (length at +0x10, inline or heap pointer).
 pub fn read_wide_string(hook: &ZholHook, address: usize) -> String {
-    // Length (UTF-16 code units) is at +0x10
     let len: i32 = read_value::<i32>(hook, address + 16, Some(Duration::from_secs(5))).unwrap();
     if len == 0 {
         return String::new();
     }
     let byte_len = len as usize * 2;
 
-    // Inline vs heap-pointer distinction
     let string_address = if byte_len >= 8 {
         let ptr: u32 = read_value::<u32>(hook, address, Some(Duration::from_secs(5))).unwrap();
         ptr as usize
@@ -111,7 +84,6 @@ pub fn read_wide_string(hook: &ZholHook, address: usize) -> String {
         Some(Duration::from_secs(5)),
     )
     .unwrap();
-    // Convert little-endian UTF-16 → Rust String
     let utf16: Vec<u16> = raw
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))

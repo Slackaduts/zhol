@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS;
+use crate::platform::Protect;
 
 use crate::process::SafeHandle;
 use crate::{await_memop, MemOpResult};
@@ -24,9 +24,9 @@ pub async fn change_memory_protection(
     addr: usize,
     size: usize,
     timeout: Option<Duration>,
-    protection: PAGE_PROTECTION_FLAGS,
-) -> MemOpResult<PAGE_PROTECTION_FLAGS> {
-    await_memop!(handle, |h| -> MemOpResult<PAGE_PROTECTION_FLAGS> {
+    protection: Protect,
+) -> MemOpResult<Protect> {
+    await_memop!(handle, |h| -> MemOpResult<Protect> {
         crate::memory::utils::change_memory_protection(&h, addr, size, timeout, protection)
     })
 }

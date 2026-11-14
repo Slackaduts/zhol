@@ -13,15 +13,19 @@ bytemuck = { version = "1.23.2", features = ["derive"] }
 dynasmrt = "3.2.1"
 parking_lot = "0.12.4"
 smol = { version = "2.0.2", optional = true }
+
+# Windows memory manipulation is done through the Win32 API.
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.58.0", features = ["Win32", "Win32_System", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug"] }
 windows-result = "0.3.4"
+
+# On Unix the target is reached through /proc/<pid>/mem and /proc/<pid>/maps.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lib]
 name = "zhol"
 path = "src/lib.rs"
-# license = "MIT"
-# keywords = ["memory", "exploit", "winapi", "process"]
-# description = "A Rust library for Windows process manipulation, memory operations, and function hooking."
-# homepage = "https://www.github.com/Slackaduts/zhol"
-# repository = "https://www.github.com/Slackaduts/zhol"
-# publish = true
+
+[dev-dependencies]
+anyhow = "1"
