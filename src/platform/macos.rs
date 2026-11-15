@@ -34,7 +34,7 @@ use mach2::port::{mach_port_t, MACH_PORT_NULL};
 use mach2::traps::{mach_task_self, task_for_pid};
 use mach2::vm::{mach_vm_read_overwrite, mach_vm_region_recurse, mach_vm_write};
 use mach2::vm_prot::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE};
-use mach2::vm_region::{vm_region_submap_info_64, VM_REGION_SUBMAP_INFO_COUNT_64};
+use mach2::vm_region::vm_region_submap_info_64;
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t};
 
 /// Per-process handle: the pid plus the target's Mach task port.
@@ -91,7 +91,10 @@ fn region_at(task: mach_port_t, addr: u64) -> Option<(u64, u64, i32)> {
     let mut size: mach_vm_size_t = 0;
     let mut depth: u32 = 0;
     let mut info: vm_region_submap_info_64 = unsafe { std::mem::zeroed() };
-    let mut count: u32 = VM_REGION_SUBMAP_INFO_COUNT_64;
+    // mach2 0.4.3 exposes no *_COUNT constant; the kernel wants the struct's size
+    // counted in natural_t (int) units — the value of C's VM_REGION_SUBMAP_INFO_COUNT_64.
+    let mut count: u32 =
+        (std::mem::size_of::<vm_region_submap_info_64>() / std::mem::size_of::<u32>()) as u32;
     let kr = unsafe {
         mach_vm_region_recurse(
             task,

@@ -142,6 +142,7 @@ pub fn end_jmp(
         hook_data.get_jmp_size(hook_impl)?,
     );
     dynasm!(ops
+        ; .arch x86
         ; jmp rel_return
     );
 
