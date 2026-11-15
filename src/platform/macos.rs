@@ -14,6 +14,28 @@
 //! OWN task (`mach_task_self`) always works and needs no entitlement — that is
 //! what the unconditional self-process tests exercise.
 //!
+//! ## Reading the game under Wine/CrossOver (entitlements / SIP)
+//! Verified against a live CrossOver-hosted Wizard101 (Wine 8, x86_64 under
+//! Rosetta 2): the Mach code here is correct — a C probe with the identical calls
+//! reads a cooperative target fine. The blocker is purely macOS's security model.
+//! CrossOver's `wineloader64` runs with the **hardened runtime and no
+//! `get-task-allow`**, so `task_for_pid` (and `task_read/inspect_for_pid`) are
+//! refused with `kr=5` (KERN_FAILURE) for any non-root, non-Apple caller — even
+//! one ad-hoc-signed with `com.apple.security.cs.debugger` (an ad-hoc cs.debugger
+//! entitlement is not honored by the kernel). `vmmap` works only because it is an
+//! Apple-platform binary with private task-port entitlements.
+//!
+//! Two routes let zhol read the live game (both are the operator's choice):
+//!   A. Run the zhol process as **root** (`sudo`). Root bypasses the hardened
+//!      get-task check for a same-user, non-Apple target. One-shot, nothing to
+//!      modify.
+//!   B. Re-sign CrossOver's wineloader with **`get-task-allow`** (keeping its
+//!      existing entitlements) and relaunch the game; zhol then attaches with no
+//!      root and no entitlement. Persistent, but it replaces the app's signature
+//!      (reversible from a backup).
+//! A target that already ships `get-task-allow` (most non-hardened binaries) is
+//! attachable by its owning user with no special steps.
+//!
 //! ## Phase status
 //! Phase 1 (this file): read / write / region / module discovery / pattern scan
 //! (the scanner is platform-agnostic on top of `read_mem`). Cave allocation,
@@ -446,20 +468,24 @@ mod tests {
         assert!(!mods.is_empty(), "self should have at least one mapped module");
     }
 
-    /// Cross-process read needs task_for_pid, which requires the debugger
-    /// entitlement or root on a SIP machine — ignored by default. Run with
-    /// `cargo test -- --ignored` on a machine/binary that can obtain it.
+    /// Cross-process read, ignored by default — it needs a target the caller is
+    /// allowed to attach. NOTE: `task_for_pid` against a macOS *platform* binary
+    /// (anything shipped under /bin, /usr/bin, …) is refused for a non-root caller
+    /// regardless of entitlements, so this `/bin/sleep` child only passes under
+    /// root. A non-root run needs a NON-platform child carrying `get-task-allow`
+    /// (e.g. an ad-hoc-signed sleeper). Run explicitly, typically as root:
+    /// `sudo cargo test -- --ignored read_child_process`.
     #[test]
     #[ignore]
     fn read_child_process() {
         use std::process::Command;
         let mut child = Command::new("/bin/sleep").arg("30").spawn().expect("spawn child");
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(300));
         let res = SafeHandle::from_pid(child.id());
         let _ = child.kill();
         let _ = child.wait();
-        let h = res.expect("task_for_pid child (needs entitlement/root)");
-        // Just prove we can query a region in another task.
+        let h = res.expect("task_for_pid child (needs root for a platform binary, or a get-task-allow child)");
+        // Prove we can query a region in another task.
         let r = region_at(h.acquire_with_timeout(None).unwrap().task, 0x1000);
         assert!(r.is_some());
     }
