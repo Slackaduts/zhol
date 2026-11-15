@@ -2,9 +2,13 @@
 //! actually EXECUTES cross-process-injected x86 code (the open question on macOS,
 //! where Rosetta 2 may keep running a cached translation of the original bytes).
 //!
-//!     cargo run --example rpcprobe -- <pid>
+//!     cargo run --example rpcprobe -- <pid> [timeout_secs]
 //!
-//! It finds wizwalker's movement-update call site (a per-frame instruction) by
+//! The movement-update site may only run while the character is moving, so for a
+//! conclusive test pass a longer timeout (e.g. 10) and MOVE the character the
+//! whole time; a bare `ran=false` with an idle character is inconclusive.
+//!
+//! It finds wizwalker's movement-update call site by
 //! pattern, then runs `rpc_via_hijack` with a one-byte `ret` payload. The
 //! trampoline saves state, calls the payload once, sets a `done` byte, restores,
 //! re-runs the displaced original, and jumps back. If `done` flips (ran == true),
@@ -25,8 +29,12 @@ const EXE: &str = "WizardGraphicalClient.exe";
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pid: u32 = std::env::args()
         .nth(1)
-        .ok_or("usage: rpcprobe <pid>")?
+        .ok_or("usage: rpcprobe <pid> [timeout_secs]")?
         .parse()?;
+    let timeout_secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
     println!("attaching to pid {pid}");
 
     let handle = SafeHandle::from_pid(pid)?;
@@ -45,8 +53,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // One-shot payload: `ret`. The trampoline calls it, then sets done = 1.
     let shellcode = [0xC3u8];
-    println!("planting one-shot RPC (ret payload); waiting up to 2s for the game thread...");
-    let ran = rpc_via_hijack(&handle, site, &shellcode, 10, 0, Duration::from_secs(2))?;
+    println!(
+        "planting one-shot RPC (ret payload); waiting up to {timeout_secs}s — MOVE the character so the site runs..."
+    );
+    let ran = rpc_via_hijack(&handle, site, &shellcode, 10, 0, Duration::from_secs(timeout_secs))?;
 
     if ran {
         println!("RESULT: ran=true — the target EXECUTED injected code (Rosetta re-translated the patch). Hooks viable.");
