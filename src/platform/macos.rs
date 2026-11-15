@@ -25,19 +25,23 @@
 //! entitlement is not honored by the kernel). `vmmap` works only because it is an
 //! Apple-platform binary with private task-port entitlements.
 //!
-//! The gate is the **target loader's signature, not the caller's privilege**:
-//! what's required is that the game's Wine loader carry `get-task-allow`. Two ways
-//! to get that (operator's choice):
+//! It takes BOTH signatures (verified against the live game): the game's Wine
+//! loader must carry `get-task-allow`, AND the zhol binary must itself be signed
+//! with `com.apple.security.cs.debugger` — an unsigned caller is refused (kr=5)
+//! even by a get-task-allow *hardened* target. (Against a NON-hardened target an
+//! unsigned caller works, as before.)
+//!
+//! Give the target loader get-task-allow (operator's choice):
 //!   A. Re-sign CrossOver's `wine64-preloader` ad-hoc with `-o runtime`, its
-//!      existing entitlements, plus `com.apple.security.get-task-allow`, and
-//!      relaunch the game. zhol then attaches with no root and no entitlement of
-//!      its own. Persistent; it replaces the app's signature, so keep a backup.
+//!      existing entitlements, plus `com.apple.security.get-task-allow`, then
+//!      relaunch the game. Persistent; it replaces the app's signature — back up.
 //!   B. Use a Wine build already ad-hoc-signed with `get-task-allow` (Homebrew /
 //!      Gcenx `wine` usually are) — works out of the box.
+//! Sign the zhol binary itself:
+//!   `codesign -s - --entitlements debugger.plist <binary>`
+//! where debugger.plist grants `com.apple.security.cs.debugger`.
 //! Running zhol as **root does NOT help**: on recent macOS (verified on 26.5) the
-//! hardened-runtime task-port check refuses even root (`task_for_pid` kr=5). A
-//! target that already ships `get-task-allow` is attachable by its owning user
-//! with no special steps.
+//! hardened-runtime task-port check refuses even root (`task_for_pid` kr=5).
 //!
 //! ## Phase status
 //! Phase 1 (this file): read / write / region / module discovery / pattern scan
@@ -273,17 +277,66 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// Read exactly `buf.len()` bytes at `addr` from `task`; false on short/error.
+fn task_read_exact(task: mach_port_t, addr: u64, buf: &mut [u8]) -> bool {
+    let mut out: mach_vm_size_t = 0;
+    let kr = unsafe {
+        mach_vm_read_overwrite(
+            task,
+            addr as mach_vm_address_t,
+            buf.len() as mach_vm_size_t,
+            buf.as_mut_ptr() as mach_vm_address_t,
+            &mut out,
+        )
+    };
+    kr == KERN_SUCCESS && out as usize == buf.len()
+}
+
+/// `SizeOfImage` of the PE whose `MZ` header is mapped at `base`, read via `task`.
+/// None if it isn't a PE. Mirrors the Linux backend's PE sizing so a Wine-hosted
+/// module's size is its real image size, not the (Rosetta-inflated) mapping span.
+fn pe_image_size(task: mach_port_t, base: u64) -> Option<usize> {
+    let mut mz = [0u8; 2];
+    if !task_read_exact(task, base, &mut mz) || &mz != b"MZ" {
+        return None;
+    }
+    let mut lfanew_b = [0u8; 4];
+    if !task_read_exact(task, base + 0x3C, &mut lfanew_b) {
+        return None;
+    }
+    let lfanew = u32::from_le_bytes(lfanew_b) as u64;
+    let mut sig = [0u8; 4];
+    if !task_read_exact(task, base + lfanew, &mut sig) || &sig != b"PE\0\0" {
+        return None;
+    }
+    // Optional header starts at sig(4)+COFF(20) = +24; SizeOfImage is at +56.
+    let mut size_b = [0u8; 4];
+    if !task_read_exact(task, base + lfanew + 24 + 56, &mut size_b) {
+        return None;
+    }
+    Some(u32::from_le_bytes(size_b) as usize)
+}
+
 /// Enumerate file-backed modules by walking the task's regions and resolving each
-/// to its backing file. Base is the lowest mapping of each path; size is the span
-/// of its mappings. (A Wine-hosted PE is mapped from its `.exe`, so it shows up
-/// here by that name — the exact base/size for a PE may want PE-header parsing
-/// later, as the Linux backend does.)
+/// to its backing file.
+///
+/// A file whose image carries an `MZ`/PE header (a Windows module under Wine) is
+/// reported at its **PE image base** with **PE `SizeOfImage`** — not the span of
+/// its mappings. Under Rosetta, Wine maps unrelated file-backed pieces far below
+/// the image (e.g. the real `WizardGraphicalClient.exe` image is at its
+/// `0x140000000` ImageBase while other mappings of the same file sit near
+/// `0x13b40_0000`), so the span is meaningless. Entries are also deduped by
+/// basename preferring the PE candidate, because Wine hard-links its
+/// `wine64-preloader` into the temp dir under the game's exe name — without this,
+/// `module_by_name("WizardGraphicalClient.exe")` returns the preloader, not the
+/// game image.
 pub fn enum_modules(handle: &SafeHandle, timeout: Option<Duration>) -> MemOpResult<Vec<Module>> {
     let guard = acquire(handle, timeout)?;
     let (task, pid) = (guard.task, guard.pid);
 
+    // Per backing path: (min mapping start, max mapping end, first MZ region seen).
     let mut order: Vec<String> = Vec::new();
-    let mut spans: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut spans: HashMap<String, (u64, u64, Option<u64>)> = HashMap::new();
 
     let mut cur: u64 = 0;
     // Bound the walk so a malformed region can't loop forever.
@@ -293,12 +346,17 @@ pub fn enum_modules(handle: &SafeHandle, timeout: Option<Duration>) -> MemOpResu
             None => break,
         };
         if let Some(path) = region_filename(pid, rstart) {
+            let mut magic = [0u8; 2];
+            let is_mz = task_read_exact(task, rstart, &mut magic) && &magic == b"MZ";
             let entry = spans.entry(path.clone()).or_insert_with(|| {
                 order.push(path.clone());
-                (rstart, rstart + rsize)
+                (rstart, rstart + rsize, None)
             });
             entry.0 = entry.0.min(rstart);
             entry.1 = entry.1.max(rstart + rsize);
+            if is_mz && entry.2.is_none() {
+                entry.2 = Some(rstart);
+            }
         }
         cur = if rstart + rsize > cur {
             rstart + rsize
@@ -307,17 +365,29 @@ pub fn enum_modules(handle: &SafeHandle, timeout: Option<Duration>) -> MemOpResu
         };
     }
 
-    Ok(order
-        .into_iter()
-        .map(|path| {
-            let (start, end) = spans[&path];
-            Module {
-                name: basename(&path).to_string(),
-                base: start as usize,
-                size: (end - start) as usize,
-            }
-        })
-        .collect())
+    // Build, deduping by basename and preferring the PE (MZ) candidate.
+    let mut by_name: Vec<(String, Module, bool)> = Vec::new();
+    for path in &order {
+        let (min_start, max_end, mz) = spans[path];
+        let is_pe = mz.is_some();
+        let (base, size) = match mz {
+            Some(b) => (b, pe_image_size(task, b).unwrap_or((max_end - b) as usize)),
+            None => (min_start, (max_end - min_start) as usize),
+        };
+        let name = basename(path).to_string();
+        let module = Module {
+            name: name.clone(),
+            base: base as usize,
+            size,
+        };
+        match by_name.iter_mut().find(|(n, _, _)| *n == name) {
+            // Replace a non-PE entry with a PE one; otherwise keep the first.
+            Some(slot) if is_pe && !slot.2 => *slot = (name, module, is_pe),
+            Some(_) => {}
+            None => by_name.push((name, module, is_pe)),
+        }
+    }
+    Ok(by_name.into_iter().map(|(_, m, _)| m).collect())
 }
 
 /// Query the region containing `addr`. If `addr` falls in a hole, reports an
