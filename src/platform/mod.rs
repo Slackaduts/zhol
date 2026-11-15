@@ -22,10 +22,15 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod unix;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub use unix::*;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::*;
 
 /// A loaded module (executable or library) in the target process.
 #[derive(Clone, Debug)]
