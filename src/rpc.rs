@@ -42,9 +42,11 @@ use crate::process::SafeHandle;
 use crate::{MemOpError, MemOpResult};
 
 const T: Option<Duration> = Some(Duration::from_secs(5));
+#[cfg(not(target_os = "macos"))]
 /// Length of an `E9 rel32` near jump.
 const JMP_LEN: usize = 5;
 
+#[cfg(not(target_os = "macos"))]
 fn rel32(from_after: i64, to: i64) -> Result<i32, MemOpError> {
     let d = to - from_after;
     if d < i32::MIN as i64 || d > i32::MAX as i64 {
@@ -62,6 +64,7 @@ fn rel32(from_after: i64, to: i64) -> Result<i32, MemOpError> {
 /// Layout: save volatile regs+flags; if `done != 0` skip the call; else 16-align
 /// the stack, `call shell` once, set `done = 1`; restore regs+flags; re-run the
 /// displaced `orig` bytes; `jmp [ret_addr]`.
+#[cfg(not(target_os = "macos"))]
 fn build_trampoline(done_addr: usize, shell_addr: usize, orig: &[u8], ret_addr: usize) -> Vec<u8> {
     let done = (done_addr as u64).to_le_bytes();
     let shell = (shell_addr as u64).to_le_bytes();
@@ -99,6 +102,7 @@ fn build_trampoline(done_addr: usize, shell_addr: usize, orig: &[u8], ret_addr: 
     out
 }
 
+#[cfg(not(target_os = "macos"))]
 /// Restores the site and reclaims cave slots on every exit path (incl. panic).
 struct Cleanup<'a> {
     handle: &'a SafeHandle,
@@ -108,6 +112,7 @@ struct Cleanup<'a> {
     slots: Vec<usize>,
 }
 
+#[cfg(not(target_os = "macos"))]
 impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
         // Panic-safe: a panic in drop aborts the process, so never unwrap here.
@@ -125,6 +130,7 @@ impl Drop for Cleanup<'_> {
 /// `orig_len` (>= 5) whole, position-independent bytes at `site` are displaced.
 /// `done_addr` is the one-shot guard byte; pass 0 to have one allocated. Blocks,
 /// polling up to `timeout`, then unplants. Returns whether the shellcode ran.
+#[cfg(not(target_os = "macos"))]
 pub fn rpc_via_hijack(
     handle: &SafeHandle,
     site: usize,
@@ -201,7 +207,126 @@ pub fn rpc_via_hijack(
     Ok(ran)
 }
 
-#[cfg(test)]
+
+// ---- macOS: pointer-redirect RPC (Rosetta-safe) ----------------------------
+// Inline code patching is ignored by Rosetta 2's cached translations, so on macOS
+// we don't hijack a code `site`. Instead we redirect a hot import's IAT slot (a
+// DATA pointer) to a fresh-page detour trampoline that runs `shellcode` once and
+// tail-calls the original import. Fresh `mach_vm_allocate` pages are translated
+// lazily on first execution; the 64-bit pointer reaches them with no rel32 limit.
+
+/// Win64 detour: run `shell` once (guarded by `done`), preserving the import's arg
+/// registers, then tail-call `original`. Entry rsp is 16n+8 (post-`call [slot]`).
+#[cfg(target_os = "macos")]
+fn build_detour(done: u64, shell: u64, original: u64) -> Vec<u8> {
+    let mut c = Vec::new();
+    c.extend_from_slice(&[0x51, 0x52, 0x41, 0x50, 0x41, 0x51]); // push rcx;rdx;r8;r9
+    c.extend_from_slice(&[0x48, 0xB8]);
+    c.extend_from_slice(&done.to_le_bytes()); // mov rax, done
+    c.extend_from_slice(&[0x80, 0x38, 0x00]); // cmp byte[rax],0
+    c.extend_from_slice(&[0x75, 0x29]); // jne +41 (skip guarded block)
+    // guarded block (41 bytes): align, 32B shadow, call shell once, done=1
+    c.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xE4, 0xF0, 0x48, 0x83, 0xEC, 0x20]);
+    c.extend_from_slice(&[0x48, 0xB8]);
+    c.extend_from_slice(&shell.to_le_bytes()); // mov rax, shell
+    c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    c.extend_from_slice(&[0x48, 0x89, 0xEC, 0x5D]); // mov rsp,rbp; pop rbp
+    c.extend_from_slice(&[0x48, 0xB8]);
+    c.extend_from_slice(&done.to_le_bytes()); // mov rax, done
+    c.extend_from_slice(&[0xC6, 0x00, 0x01]); // mov byte[rax],1
+    // skip:
+    c.extend_from_slice(&[0x41, 0x59, 0x41, 0x58, 0x5A, 0x59]); // pop r9;r8;rdx;rcx
+    c.extend_from_slice(&[0x48, 0xB8]);
+    c.extend_from_slice(&original.to_le_bytes()); // mov rax, original
+    c.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
+    c
+}
+
+/// Hot imports to redirect; whichever the target actually calls fires first. A
+/// shared `done` guard makes the shellcode run exactly once across all of them.
+#[cfg(target_os = "macos")]
+const RPC_CANDIDATE_IMPORTS: &[&str] = &[
+    "timeGetTime",
+    "QueryPerformanceCounter",
+    "GetTickCount64",
+    "GetTickCount",
+    "GetSystemTimeAsFileTime",
+];
+
+#[cfg(target_os = "macos")]
+pub fn rpc_via_hijack(
+    handle: &SafeHandle,
+    _site: usize,
+    shellcode: &[u8],
+    _orig_len: usize,
+    _done_addr: usize,
+    timeout: Duration,
+) -> MemOpResult<bool> {
+    use crate::process::module::{find_import_slot, get_named_modules};
+
+    if shellcode.is_empty() {
+        return Err(MemOpError::Message("empty shellcode".into()));
+    }
+
+    let exe = get_named_modules(handle, T)?
+        .into_iter()
+        .find(|m| m.name.to_lowercase().ends_with(".exe"))
+        .ok_or_else(|| MemOpError::Message("no .exe module in target".into()))?;
+
+    let done = platform::alloc(handle, 8)?;
+    write_bytes(handle, done, &[0u8; 8], T)?;
+    let shell = platform::alloc_code(handle, shellcode.len())?;
+    write_bytes(handle, shell, shellcode, T)?;
+
+    // Redirect every present candidate slot to its own detour trampoline.
+    let mut hooked: Vec<(usize, u64, usize)> = Vec::new(); // (slot, original, tramp)
+    for name in RPC_CANDIDATE_IMPORTS {
+        let slot = match find_import_slot(handle, exe.base, name)? {
+            Some(s) => s,
+            None => continue,
+        };
+        let ob = read_bytes(handle, slot, 8, T)?;
+        let original = u64::from_le_bytes(ob[..8].try_into().unwrap());
+        let tramp = platform::alloc_code(handle, 128)?;
+        let code = build_detour(done as u64, shell as u64, original);
+        write_bytes(handle, tramp, &code, T)?;
+        write_bytes(handle, slot, &(tramp as u64).to_le_bytes(), T)?;
+        hooked.push((slot, original, tramp));
+    }
+    if hooked.is_empty() {
+        let _ = platform::reclaim_cave(handle, shell);
+        let _ = platform::reclaim_cave(handle, done);
+        return Err(MemOpError::Message(
+            "no redirectable hot import found in target".into(),
+        ));
+    }
+
+    // Poll the done byte up to the timeout.
+    let start = Instant::now();
+    let mut ran = false;
+    while start.elapsed() < timeout {
+        std::thread::sleep(Duration::from_millis(5));
+        if read_bytes(handle, done, 1, T).map(|b| b[0] == 1).unwrap_or(false) {
+            ran = true;
+            break;
+        }
+    }
+
+    // Restore all slots (stop routing through us), let in-flight calls drain, free.
+    for &(slot, original, _) in &hooked {
+        let _ = write_bytes(handle, slot, &original.to_le_bytes(), T);
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    for &(_, _, tramp) in &hooked {
+        let _ = platform::reclaim_cave(handle, tramp);
+    }
+    let _ = platform::reclaim_cave(handle, shell);
+    let _ = platform::reclaim_cave(handle, done);
+
+    Ok(ran)
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
 
