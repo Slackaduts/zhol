@@ -1,15 +1,16 @@
-//! Non-destructive write round-trip against a running process, proving the
-//! `/proc/<pid>/mem` write path (the same path hook installation needs).
+//! Non-destructive write round-trip against a running process, proving the OS
+//! write path (the same path hook installation needs).
 //!
 //!     cargo run --example writecheck -- [pid | exe-name]
 //!
-//! It finds a writable anonymous region, reads 8 bytes, writes the SAME bytes
-//! back (so game state is unchanged), and confirms the read-back matches.
+//! It finds a writable region, reads 8 bytes, writes a sentinel, confirms it
+//! landed, then restores the original bytes (so game state is unchanged).
 
 use std::time::Duration;
 
 use zhol::memory::read::read_bytes;
 use zhol::memory::write::write_bytes;
+use zhol::platform::query_region;
 use zhol::process::SafeHandle;
 
 fn find_pid_by_exe(name: &str) -> Option<u32> {
@@ -34,26 +35,21 @@ fn find_pid_by_exe(name: &str) -> Option<u32> {
     None
 }
 
-/// First writable, non-executable, anonymous (no file path) region — heap-like,
-/// the safest place to prove a write without touching mapped code or data.
-fn writable_anon_addr(pid: u32) -> Option<usize> {
-    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
-    for line in maps.lines() {
-        let mut it = line.split_whitespace();
-        let range = it.next()?;
-        let perms = it.next()?;
-        let _off = it.next();
-        let _dev = it.next();
-        let _inode = it.next();
-        let path = it.next();
-        if perms.starts_with("rw") && !perms.contains('x') && path.is_none() {
-            let (start, end) = range.split_once('-')?;
-            let start = usize::from_str_radix(start, 16).ok()?;
-            let end = usize::from_str_radix(end, 16).ok()?;
-            if end - start >= 0x100000 {
-                return Some(start + 0x10000);
-            }
+/// First large writable, non-executable, committed region — heap-like, the safest
+/// place to prove a write without touching mapped code. Portable: walks regions
+/// via `query_region` rather than parsing `/proc/<pid>/maps` (absent on macOS).
+fn writable_region_addr(handle: &SafeHandle, t: Option<Duration>) -> Option<usize> {
+    let mut addr: usize = 0x1_0000; // skip the null page
+    for _ in 0..200_000 {
+        let r = query_region(handle, addr, t).ok()?;
+        if r.size == 0 {
+            break;
         }
+        if r.committed && r.readable && r.writable && !r.executable && r.size >= 0x100000 {
+            return Some(r.base + 0x10000);
+        }
+        let next = r.base.checked_add(r.size)?;
+        addr = if next > addr { next } else { addr.checked_add(0x1000)? };
     }
     None
 }
@@ -70,8 +66,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = SafeHandle::from_pid(pid)?;
     let t = Some(Duration::from_secs(5));
 
-    let addr = writable_anon_addr(pid)
-        .ok_or_else(|| format!("no writable anonymous region found"))?;
+    let addr = writable_region_addr(&handle, t)
+        .ok_or_else(|| format!("no writable region found"))?;
     println!("writable test address: {addr:#x}");
 
     let original = read_bytes(&handle, addr, 8, t)?;
