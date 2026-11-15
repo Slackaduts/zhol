@@ -25,16 +25,19 @@
 //! entitlement is not honored by the kernel). `vmmap` works only because it is an
 //! Apple-platform binary with private task-port entitlements.
 //!
-//! Two routes let zhol read the live game (both are the operator's choice):
-//!   A. Run the zhol process as **root** (`sudo`). Root bypasses the hardened
-//!      get-task check for a same-user, non-Apple target. One-shot, nothing to
-//!      modify.
-//!   B. Re-sign CrossOver's wineloader with **`get-task-allow`** (keeping its
-//!      existing entitlements) and relaunch the game; zhol then attaches with no
-//!      root and no entitlement. Persistent, but it replaces the app's signature
-//!      (reversible from a backup).
-//! A target that already ships `get-task-allow` (most non-hardened binaries) is
-//! attachable by its owning user with no special steps.
+//! The gate is the **target loader's signature, not the caller's privilege**:
+//! what's required is that the game's Wine loader carry `get-task-allow`. Two ways
+//! to get that (operator's choice):
+//!   A. Re-sign CrossOver's `wine64-preloader` ad-hoc with `-o runtime`, its
+//!      existing entitlements, plus `com.apple.security.get-task-allow`, and
+//!      relaunch the game. zhol then attaches with no root and no entitlement of
+//!      its own. Persistent; it replaces the app's signature, so keep a backup.
+//!   B. Use a Wine build already ad-hoc-signed with `get-task-allow` (Homebrew /
+//!      Gcenx `wine` usually are) — works out of the box.
+//! Running zhol as **root does NOT help**: on recent macOS (verified on 26.5) the
+//! hardened-runtime task-port check refuses even root (`task_for_pid` kr=5). A
+//! target that already ships `get-task-allow` is attachable by its owning user
+//! with no special steps.
 //!
 //! ## Phase status
 //! Phase 1 (this file): read / write / region / module discovery / pattern scan
