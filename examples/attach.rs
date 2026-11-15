@@ -89,6 +89,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         matches.first().map(|(off, _)| *off)
     );
 
-    println!("OK: read + module resolution + scan all succeeded against the Proton client");
+    println!("OK: read + module resolution + scan all succeeded against the live client");
     Ok(())
 }
