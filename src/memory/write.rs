@@ -2,7 +2,6 @@
 
 use std::time::Duration;
 
-use anyhow::anyhow;
 
 use crate::hooks::ZholHook;
 use crate::memory::utils::{change_memory_protection, wait_for_safe_mem};
@@ -30,10 +29,24 @@ pub fn write_bytes(
     change_memory_protection(handle, addr, bytes.len(), timeout, old_protect)?;
 
     if written != bytes.len() {
-        return Err(anyhow!("An error prevented all bytes from being written.").into());
+        return Err(crate::memop_err!("An error prevented all bytes from being written.").into());
     }
 
     Ok(())
+}
+
+/// Hook-free typed write: write the raw bytes of a Pod `T` at `addr`.
+///
+/// The counterpart to [`read_pod`](crate::memory::read::read_pod); needs no
+/// [`ZholHook`]/[`MemOpContext`], so it is the path for writing a plain scalar at
+/// a known absolute address (pymem-style shim, `Process::write_typed`).
+pub fn write_pod<T: bytemuck::Pod>(
+    handle: &SafeHandle,
+    addr: usize,
+    value: T,
+    timeout: Option<Duration>,
+) -> MemOpResult<()> {
+    write_bytes(handle, addr, bytemuck::bytes_of(&value), timeout)
 }
 
 /// Transmute a value to bytes and write it at `address`.

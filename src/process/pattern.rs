@@ -1,5 +1,4 @@
 use crate::memory::Byte;
-use anyhow::Result;
 
 /// Top-level function for performing memory AOB scans.
 ///
@@ -9,13 +8,13 @@ use anyhow::Result;
 /// * `origin`: Address to begin searching at
 /// * `size`: Size (in bytes) of search area
 /// # Returns
-/// * `anyhow::Result<Vec<(usize, Vec<u8>)>>`: Anyhow result of a vector of addresses where a match was found, including bytes found at matches
+/// * `crate::MemOpResult<Vec<(usize, Vec<u8>)>>`: Anyhow result of a vector of addresses where a match was found, including bytes found at matches
 pub fn pattern_scan(
     handle: &crate::process::SafeHandle,
     pattern: &str,
     origin: usize,
     size: usize,
-) -> anyhow::Result<Vec<(usize, Vec<u8>)>> {
+) -> crate::MemOpResult<Vec<(usize, Vec<u8>)>> {
     use crate::process::pattern::{find_pattern_in_bytes, prepare_pattern};
 
 
@@ -60,8 +59,8 @@ fn byte_matches(byte: &u8, pattern: Byte) -> bool {
 /// * `bytes`: Vector of bytes to search
 /// * `pattern`: Vec of optional bytes to find
 /// # Returns
-/// * `anyhow::Result<Vec<(usize, Vec<usize>)>>`: Vector of addresses relative to the provided bytes, with a byte vector of the bytes found at the pattern.
-pub fn find_pattern_in_bytes(bytes: Vec<u8>, pattern: Vec<Byte>) -> Result<Vec<(usize, Vec<u8>)>> {
+/// * `crate::MemOpResult<Vec<(usize, Vec<usize>)>>`: Vector of addresses relative to the provided bytes, with a byte vector of the bytes found at the pattern.
+pub fn find_pattern_in_bytes(bytes: Vec<u8>, pattern: Vec<Byte>) -> crate::MemOpResult<Vec<(usize, Vec<u8>)>> {
     let pattern_length = pattern.len();
     let mut matches: Vec<(usize, Vec<u8>)> = Vec::new();
 

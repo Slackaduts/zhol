@@ -20,12 +20,12 @@ pub trait Transmutable<T> {
         bytes: &Vec<u8>,
         _hook: &ZholHook,
         _context: &MemOpContext,
-    ) -> anyhow::Result<Option<T>>;
+    ) -> crate::MemOpResult<Option<T>>;
 
     /// For custom implmentations where hard data types need extra steps to convert to their byte representation.
     /// 
     /// This is not needed in cases where the type follows the C memory layout.
-    fn byte_repr(&self, _hook: &ZholHook, _context: &MemOpContext) -> anyhow::Result<Vec<u8>>;
+    fn byte_repr(&self, _hook: &ZholHook, _context: &MemOpContext) -> crate::MemOpResult<Vec<u8>>;
 }
 
 impl<T: Transmutable<T> + bytemuck::Pod> ZholTyped<T> for T {}
@@ -44,9 +44,9 @@ impl<T: bytemuck::Pod + AutoImplTransmutable> Transmutable<T> for T {
         bytes: &Vec<u8>,
         _hook: &ZholHook,
         _context: &MemOpContext,
-    ) -> anyhow::Result<Option<T>> {
+    ) -> crate::MemOpResult<Option<T>> {
         let value = bytemuck::try_pod_read_unaligned::<T>(&bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to convert bytes to type: {}", e))?;
+            .map_err(|e| crate::memop_err!("Failed to convert bytes to type: {}", e))?;
         Ok(Some(value))
     }
 
@@ -54,7 +54,7 @@ impl<T: bytemuck::Pod + AutoImplTransmutable> Transmutable<T> for T {
         &self,
         _hook_opt: &ZholHook,
         _context: &MemOpContext,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> crate::MemOpResult<Vec<u8>> {
         Ok(bytemuck::bytes_of::<T>(self).to_vec())
     }
 }

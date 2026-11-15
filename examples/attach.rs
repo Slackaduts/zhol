@@ -39,17 +39,17 @@ fn find_pid_by_exe(name: &str) -> Option<u32> {
     None
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arg = std::env::args().nth(1);
     let (pid, exe) = match arg {
         Some(a) if a.chars().all(|c| c.is_ascii_digit()) => (a.parse::<u32>()?, None),
         Some(a) => (
-            find_pid_by_exe(&a).ok_or_else(|| anyhow::anyhow!("no process named {a}"))?,
+            find_pid_by_exe(&a).ok_or_else(|| format!("no process named {a}"))?,
             Some(a),
         ),
         None => (
             find_pid_by_exe(DEFAULT_EXE)
-                .ok_or_else(|| anyhow::anyhow!("no {DEFAULT_EXE} running"))?,
+                .ok_or_else(|| format!("no {DEFAULT_EXE} running"))?,
             Some(DEFAULT_EXE.to_string()),
         ),
     };
@@ -66,7 +66,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let module = module_by_name(&handle, &exe, true, t)?
-        .ok_or_else(|| anyhow::anyhow!("module {exe} not found in target"))?;
+        .ok_or_else(|| format!("module {exe} not found in target"))?;
     println!(
         "main module: {} base={:#x} size={:#x}",
         module.name, module.base, module.size

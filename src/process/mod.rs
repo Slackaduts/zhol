@@ -12,14 +12,14 @@ use crate::{MemOpError, MemOpResult};
 /// A macro for safely acquiring and using a handle with timeout support.
 ///
 /// Acquires the handle's guard (which derefs to the platform [`Target`]),
-/// evaluates `$block`, and maps a timeout to [`MemOpError::TimeoutReached`].
+/// evaluates `$block`, and maps a timeout to [`MemOpError::Timeout`].
 #[macro_export]
 macro_rules! with_handle {
     ($handle:expr, $timeout:expr, |$guard:ident| -> $ret:ty, $block:expr) => {{
         let safe_handle: &$crate::process::SafeHandle = $handle;
         let result: $crate::MemOpResult<$ret> = match safe_handle.acquire_with_timeout($timeout) {
             Some($guard) => $block,
-            None => Err($crate::MemOpError::TimeoutReached(($timeout, None))),
+            None => Err($crate::MemOpError::Timeout($timeout)),
         };
         result
     }};
@@ -93,5 +93,5 @@ impl<'a> std::ops::Deref for SafeHandleGuard<'a> {
 
 /// Convenience: a timeout helper used by the backends.
 pub(crate) fn _timeout_err(timeout: Option<Duration>) -> MemOpError {
-    MemOpError::TimeoutReached((timeout, None))
+    MemOpError::Timeout(timeout)
 }

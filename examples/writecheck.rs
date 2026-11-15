@@ -58,12 +58,12 @@ fn writable_anon_addr(pid: u32) -> Option<usize> {
     None
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arg = std::env::args().nth(1).unwrap_or_else(|| "WizardGraphicalClient.exe".into());
     let pid = if arg.chars().all(|c| c.is_ascii_digit()) {
         arg.parse()?
     } else {
-        find_pid_by_exe(&arg).ok_or_else(|| anyhow::anyhow!("no process named {arg}"))?
+        find_pid_by_exe(&arg).ok_or_else(|| format!("no process named {arg}"))?
     };
     println!("attaching to pid {pid}");
 
@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
     let t = Some(Duration::from_secs(5));
 
     let addr = writable_anon_addr(pid)
-        .ok_or_else(|| anyhow::anyhow!("no writable anonymous region found"))?;
+        .ok_or_else(|| format!("no writable anonymous region found"))?;
     println!("writable test address: {addr:#x}");
 
     let original = read_bytes(&handle, addr, 8, t)?;
@@ -83,12 +83,12 @@ fn main() -> anyhow::Result<()> {
     write_bytes(&handle, addr, &sentinel, t)?;
     let after = read_bytes(&handle, addr, 8, t)?;
     println!("read after write:{after:02X?}");
-    anyhow::ensure!(after == sentinel, "sentinel not observed: write did not take");
+    if !(after == sentinel) { return Err("sentinel not observed: write did not take".into()); }
 
     write_bytes(&handle, addr, &original, t)?;
     let restored = read_bytes(&handle, addr, 8, t)?;
     println!("read after restore:{restored:02X?}");
-    anyhow::ensure!(restored == original, "restore failed");
+    if !(restored == original) { return Err("restore failed".into()); }
     println!("OK: write mutated memory and was restored cleanly");
     Ok(())
 }

@@ -1,10 +1,10 @@
 //! Memory helpers: protection changes, readiness waiting, allocation, and the
 //! fixed-size C-string helper. All OS access goes through [`crate::platform`].
 
+#[cfg(not(unix))]
 use std::thread::park_timeout;
 use std::time::{Duration, Instant};
 
-use anyhow::anyhow;
 use bytemuck::{Pod, Zeroable};
 
 use crate::memory::MemoryRegion;
@@ -43,11 +43,27 @@ pub fn wait_for_safe_mem(
         if ok {
             return Ok(());
         }
+        // On the Unix `/proc` backend a region's readiness is static for our
+        // purposes: we do not drive the target's allocation, so parking here
+        // cannot make an unmapped page appear. Worse, a caller that dereferences
+        // a stale/NULL game pointer (e.g. a poller reading a not-yet-hooked
+        // client) would otherwise block the full timeout on every such read,
+        // starving a single-threaded event loop. Fail fast instead of parking;
+        // the caller's own retry loop (with its own delay) handles transients.
+        #[cfg(unix)]
+        {
+            let _ = deadline;
+            return Err(MemOpError::Message(format!(
+                "memory at {address:#x} not {}",
+                if needs_write { "writable" } else { "readable" }
+            )));
+        }
+        #[cfg(not(unix))]
         match deadline {
             Some(d) => {
                 let now = Instant::now();
                 if now >= d {
-                    return Err(MemOpError::Other(anyhow!(
+                    return Err(MemOpError::Message(format!(
                         "memory at {address:#x} not {} before timeout",
                         if needs_write { "writable" } else { "readable" }
                     )));
@@ -55,7 +71,7 @@ pub fn wait_for_safe_mem(
                 park_timeout(d - now);
             }
             None => {
-                return Err(MemOpError::Other(anyhow!(
+                return Err(MemOpError::Message(format!(
                     "memory at {address:#x} not {}",
                     if needs_write { "writable" } else { "readable" }
                 )))
@@ -99,7 +115,7 @@ impl CStr256 {
     pub fn try_from_str(s: &str) -> Result<Self, MemOpError> {
         let bytes = s.as_bytes();
         if bytes.len() > 255 {
-            return Err(MemOpError::Other(anyhow!("string too long for CStr256")));
+            return Err(MemOpError::Message(format!("string too long for CStr256")));
         }
         let mut data = [0u8; 256];
         data[..bytes.len()].copy_from_slice(bytes);

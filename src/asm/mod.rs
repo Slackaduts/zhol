@@ -1,17 +1,16 @@
 use crate::hooks::*;
 
-use anyhow::{anyhow, Result};
 use dynasmrt::{dynasm, x86::X86Relocation, Assembler, DynasmApi};
 
-/// Compiles a dynasmrt Assembler, and provides anyhow error propogation.
+/// Compiles a dynasmrt Assembler, and propagates errors as MemOpError.
 ///
 /// # Arguments
 /// * `ops`: X86 Assembler object, after dynasm! has been called
 /// # Returns
-/// * `anyhow::Result<Vec<usize>>`: Anyhow result containing the bytes of compiled x86 ASM
-pub fn handle_x86_asm_build(ops: Assembler<X86Relocation>) -> Result<Vec<u8>> {
+/// * `crate::MemOpResult<Vec<usize>>`: Anyhow result containing the bytes of compiled x86 ASM
+pub fn handle_x86_asm_build(ops: Assembler<X86Relocation>) -> crate::MemOpResult<Vec<u8>> {
     return match ops.finalize() {
-        Err(e) => Err(anyhow!(
+        Err(e) => Err(crate::memop_err!(
             "Error occured when compiling bytecode: \"{:#?}\"",
             e
         )),
@@ -58,13 +57,13 @@ fn apply_nops(
 // /// * `hook`: Hook object containing the hook memory address
 // /// * `target`: The address to jump to
 // /// # Returns
-// /// * `anyhow::Result<()>`: Anyhow result indicating success or failure
+// /// * `crate::MemOpResult<()>`: Anyhow result indicating success or failure
 // pub fn end_jmp<T: HookImpl>(
 //     ops: &mut Assembler<X86Relocation>,
 //     nops: Option<usize>,
 //     hook: &Hook<T>,
 //     target: usize,
-// ) -> Result<()> {
+// ) -> crate::MemOpResult<()> {
 //     let rel_return = calc_rel_inst(
 //         &ops,
 //         hook.hook_mem.addr as usize,
@@ -87,8 +86,8 @@ fn apply_nops(
 // /// # Arguments
 // /// * `hook`: Hook object containing the hook memory address
 // /// # Returns
-// /// * `anyhow::Result<dynasm::Assembler<dynasmrt::x86::X86Relocation>>`: Anyhow result containing the Assembler object
-// pub fn newmem_jmp<T: HookImpl>(hook: &Hook<T>) -> Result<Assembler<X86Relocation>> {
+// /// * `crate::MemOpResult<dynasm::Assembler<dynasmrt::x86::X86Relocation>>`: Anyhow result containing the Assembler object
+// pub fn newmem_jmp<T: HookImpl>(hook: &Hook<T>) -> crate::MemOpResult<Assembler<X86Relocation>> {
 //     let mut ops: Assembler<X86Relocation> = Assembler::new()?;
 //     let newmem = hook.hook_mem.addr as i32;
 //     let newmem_rel_jmp = newmem - (hook.get_addr()? as i32 + 5);
@@ -106,8 +105,8 @@ fn apply_nops(
 /// # Arguments
 /// * `hook`: Hook runtime data
 /// # Returns
-/// * `anyhow::Result<dynasm::Assembler<dynasmrt::x86::X86Relocation>>`: Anyhow result containing the Assembler object
-pub fn newmem_jmp(hook: &HookData) -> Result<Assembler<X86Relocation>> {
+/// * `crate::MemOpResult<dynasm::Assembler<dynasmrt::x86::X86Relocation>>`: Anyhow result containing the Assembler object
+pub fn newmem_jmp(hook: &HookData) -> crate::MemOpResult<Assembler<X86Relocation>> {
     let mut ops: Assembler<X86Relocation> = Assembler::new()?;
     let newmem = hook.hook_mem.addr as i32;
     let newmem_rel_jmp = newmem - (hook.get_addr()? as i32 + 5);
@@ -128,14 +127,14 @@ pub fn newmem_jmp(hook: &HookData) -> Result<Assembler<X86Relocation>> {
 /// * 'hook_impl': Hook impl to use, supplies hook-specific compiletime data
 /// * `target`: The address to jump to
 /// # Returns
-/// * `anyhow::Result<()>`: Anyhow result indicating success or failure
+/// * `crate::MemOpResult<()>`: Anyhow result indicating success or failure
 pub fn end_jmp(
     ops: &mut Assembler<X86Relocation>,
     nops: Option<usize>,
     hook_data: &HookData,
     hook_impl: &dyn HookImpl,
     target: usize,
-) -> Result<()> {
+) -> crate::MemOpResult<()> {
     let rel_return = calc_rel_inst(
         &ops,
         hook_data.hook_mem.addr as usize,

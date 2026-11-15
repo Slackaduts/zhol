@@ -13,7 +13,6 @@ use crate::process::module::module_by_name;
 use crate::process::pattern::{create_unhook_bytes, find_pattern_in_bytes};
 use crate::process::SafeHandle;
 
-use anyhow::{anyhow, Result};
 use std::time::Duration;
 
 
@@ -74,7 +73,7 @@ impl Hook {
     ) -> MemOpResult<std::sync::Arc<Self>> {
         // Initialize with default HookData
         let maybe_module = module_by_name(&handle, hook_impl.module_name(), true, None)?;
-        let module = maybe_module.ok_or(anyhow!("Could not get module Zhol.exe."))?;
+        let module = maybe_module.ok_or(crate::memop_err!("Could not get module Zhol.exe."))?;
         let data = HookData {
             module_addr: module.base,
             hook_mem: allocate_memory(&handle, hook_impl.hook_alloc_size())?,
@@ -127,7 +126,7 @@ pub trait HookOps: Send + Sync {
         MemOpContext::new(data.var_mem.addr, offset, at_pointer, timeout)
     }
 }
-use crate::{memop_err, MemOpError, MemOpResult};
+use crate::{MemOpError, MemOpResult};
 impl HookOps for Hook {
     fn data(&self) -> &std::sync::Arc<parking_lot::RwLock<HookData>> {
         &self.data
@@ -184,7 +183,7 @@ impl HookOps for Hook {
         let hook_bytes = self.hook_impl.build_hook(&data_read)?;
         let jump_bytes = self.hook_impl.build_jmp(&data_read)?;
 
-        let addr = data_read.addr.ok_or(anyhow!(
+        let addr = data_read.addr.ok_or(crate::memop_err!(
             "Inject point address was not found. This should not be possible."
         ))?;
 
@@ -218,7 +217,7 @@ impl HookOps for Hook {
                 )?;
             }
             None => {
-                return Err(memop_err!(
+                return Err(crate::memop_err!(
                     "Unhook called without pattern scanned and match found."
                 ))
             }
@@ -245,25 +244,66 @@ pub struct HookData {
 }
 
 impl HookData {
-    pub fn get_addr(&self) -> Result<usize> {
-        self.addr.ok_or(anyhow!(
+    pub fn get_addr(&self) -> crate::MemOpResult<usize> {
+        self.addr.ok_or(crate::memop_err!(
             "get_addr() called without pattern scanned and injection point found."
         ))
     }
 
-    pub fn get_jmp_size<T: HookImpl + ?Sized>(&self, hook_impl: &T) -> Result<usize> {
+    pub fn get_jmp_size<T: HookImpl + ?Sized>(&self, hook_impl: &T) -> crate::MemOpResult<usize> {
         Ok(hook_impl.build_jmp(self)?.len())
     }
 
-    pub fn get_nth_unhook_byte(&self, index: usize) -> Result<u8> {
-        let found_bytes = self.found_bytes.as_ref().ok_or(anyhow!(
+    pub fn get_nth_unhook_byte(&self, index: usize) -> crate::MemOpResult<u8> {
+        let found_bytes = self.found_bytes.as_ref().ok_or(crate::memop_err!(
             "Unhook bytes called without pattern scanning and finding a match."
         ))?;
 
         found_bytes
             .get(index)
-            .ok_or(anyhow!("Index \"{}\" not in range unhookbytes.", index))
+            .ok_or(crate::memop_err!("Index \"{}\" not in range unhookbytes.", index))
             .copied()
+    }
+}
+
+/// RAII owner for a [`ZholHook`]: unhooks on drop (best-effort, idempotent).
+///
+/// `Hook`/`ZholHook` is `Clone`, so a blanket `Drop` on it would unhook once per
+/// clone and corrupt the shared injection site; wrap the *single* owning handle
+/// in a guard instead. SIGKILL / hard crash still cannot be covered — no
+/// destructor runs.
+pub struct HookGuard {
+    hook: ZholHook,
+    timeout: Duration,
+    active: std::sync::atomic::AtomicBool,
+}
+
+impl HookGuard {
+    pub fn new(hook: ZholHook, timeout: Duration) -> Self {
+        Self {
+            hook,
+            timeout,
+            active: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Unhook now. Idempotent: a later drop won't repeat it.
+    pub fn unhook(&self) -> MemOpResult<()> {
+        if self.active.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.hook.unhook(self.timeout)?;
+        }
+        Ok(())
+    }
+
+    pub fn hook(&self) -> &ZholHook {
+        &self.hook
+    }
+}
+
+impl Drop for HookGuard {
+    fn drop(&mut self) {
+        // Panic-safe: never unwrap in drop.
+        let _ = self.unhook();
     }
 }
 
@@ -283,11 +323,11 @@ pub trait HookImpl: Send + Sync + CloneHookImpl {
     }
 
     // Hook building functionality
-    fn build_jmp(&self, hook_data: &HookData) -> Result<Vec<u8>> {
+    fn build_jmp(&self, hook_data: &HookData) -> crate::MemOpResult<Vec<u8>> {
         let ops = newmem_jmp(hook_data)?;
         handle_x86_asm_build(ops)
     }
 
     // Must be implemented by concrete hooks
-    fn build_hook(&self, hook_data: &HookData) -> Result<Vec<u8>>;
+    fn build_hook(&self, hook_data: &HookData) -> crate::MemOpResult<Vec<u8>>;
 }

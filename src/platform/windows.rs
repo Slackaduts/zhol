@@ -7,7 +7,6 @@
 
 use std::time::Duration;
 
-use anyhow::anyhow;
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{GetLastError, HANDLE, HMODULE};
 use windows::Win32::System::Diagnostics::Debug::{
@@ -58,7 +57,7 @@ pub fn open(pid: u32) -> MemOpResult<Target> {
             pid,
         )
     }
-    .map_err(|e| MemOpError::Os((format!("OpenProcess({pid}): {e}"), None)))?;
+    .map_err(|e| MemOpError::Os(format!("OpenProcess({pid}): {e}")))?;
     Ok(Target { handle })
 }
 
@@ -82,7 +81,7 @@ pub fn last_error() -> MemOpError {
         } else {
             String::new()
         };
-        MemOpError::Os((format!("Windows error {:08X}: {}", code.0, msg), None))
+        MemOpError::Os(format!("Windows error {:08X}: {}", code.0, msg))
     }
 }
 
@@ -92,7 +91,7 @@ fn acquire<'a>(
 ) -> MemOpResult<crate::process::SafeHandleGuard<'a>> {
     handle
         .acquire_with_timeout(timeout)
-        .ok_or(MemOpError::TimeoutReached((timeout, None)))
+        .ok_or(MemOpError::Timeout(timeout))
 }
 
 pub fn read_mem(
@@ -112,7 +111,7 @@ pub fn read_mem(
             size,
             Some(&mut bytes_read),
         )
-        .map_err(|e| MemOpError::Os((format!("ReadProcessMemory @ {addr:#x}: {e}"), None)))?;
+        .map_err(|e| MemOpError::Os(format!("ReadProcessMemory @ {addr:#x}: {e}")))?;
     }
     buffer.truncate(bytes_read);
     Ok(buffer)
@@ -134,7 +133,7 @@ pub fn write_mem(
             bytes.len(),
             Some(&mut bytes_written),
         )
-        .map_err(|e| MemOpError::Os((format!("WriteProcessMemory @ {addr:#x}: {e}"), None)))?;
+        .map_err(|e| MemOpError::Os(format!("WriteProcessMemory @ {addr:#x}: {e}")))?;
     }
     Ok(bytes_written)
 }
@@ -143,7 +142,7 @@ fn module_info(handle: HANDLE, module: HMODULE) -> MemOpResult<MODULEINFO> {
     let mut info = MODULEINFO::default();
     unsafe {
         GetModuleInformation(handle, module, &mut info, std::mem::size_of::<MODULEINFO>() as u32)
-            .map_err(|e| MemOpError::Os((format!("GetModuleInformation: {e}"), None)))?;
+            .map_err(|e| MemOpError::Os(format!("GetModuleInformation: {e}")))?;
     }
     Ok(info)
 }
@@ -165,7 +164,7 @@ pub fn enum_modules(handle: &SafeHandle, timeout: Option<Duration>) -> MemOpResu
             (modules.len() * std::mem::size_of::<HMODULE>()) as u32,
             &mut bytes_needed,
         )
-        .map_err(|e| MemOpError::Os((format!("EnumProcessModules: {e}"), None)))?;
+        .map_err(|e| MemOpError::Os(format!("EnumProcessModules: {e}")))?;
         modules.truncate(bytes_needed as usize / std::mem::size_of::<HMODULE>());
     }
 
@@ -238,13 +237,27 @@ pub fn alloc(handle: &SafeHandle, size: usize) -> MemOpResult<usize> {
     Ok(addr as usize)
 }
 
+/// Executable scratch. On Windows `alloc` already returns `PAGE_EXECUTE_READWRITE`
+/// memory, so code and data allocation are the same; the split only matters on
+/// Unix, where the data cave is non-executable.
+pub fn alloc_code(handle: &SafeHandle, size: usize) -> MemOpResult<usize> {
+    alloc(handle, size)
+}
+
 pub fn free(handle: &SafeHandle, addr: usize, _size: usize) -> MemOpResult<()> {
     let guard = acquire(handle, Some(Duration::from_millis(10)))?;
     unsafe {
         VirtualFreeEx(guard.handle, addr as *mut _, 0, MEM_RELEASE)
-            .map_err(|e| MemOpError::Os((format!("VirtualFreeEx @ {addr:#x}: {e}"), None)))?;
+            .map_err(|e| MemOpError::Os(format!("VirtualFreeEx @ {addr:#x}: {e}")))?;
     }
     Ok(())
+}
+
+/// Reclaim a block allocated via [`alloc`]. On Windows allocations are real
+/// `VirtualAllocEx` regions, so this simply releases by base (the Unix backend's
+/// free-list has no analogue here).
+pub fn reclaim_cave(handle: &SafeHandle, addr: usize) -> MemOpResult<()> {
+    free(handle, addr, 0)
 }
 
 pub fn protect(
@@ -264,7 +277,7 @@ pub fn protect(
             PAGE_PROTECTION_FLAGS(prot.0),
             &mut old,
         )
-        .map_err(|e| MemOpError::Os((format!("VirtualProtectEx @ {addr:#x}: {e}"), None)))?;
+        .map_err(|e| MemOpError::Os(format!("VirtualProtectEx @ {addr:#x}: {e}")))?;
     }
     Ok(Protect(old.0))
 }

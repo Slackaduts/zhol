@@ -3,7 +3,6 @@
 use std::any::type_name;
 use std::time::Duration;
 
-use anyhow::anyhow;
 
 use crate::hooks::ZholHook;
 use crate::memory::utils::wait_for_safe_mem;
@@ -27,6 +26,24 @@ pub fn read_bytes(
     platform::read_mem(handle, addr, size, timeout)
 }
 
+/// Hook-free typed read: read `size_of::<T>()` bytes at `addr` and reinterpret
+/// them as a Pod `T`.
+///
+/// Unlike [`read_value`], this needs no [`ZholHook`]/[`MemOpContext`] — it is the
+/// path for reading a plain scalar at a known absolute address, which is how the
+/// pymem-style shim and `Process::read_typed` work. The `Transmutable` machinery
+/// stays for the hook path (custom pointer-chasing impls); this is its
+/// decoupled, address-only counterpart.
+pub fn read_pod<T: bytemuck::Pod>(
+    handle: &SafeHandle,
+    addr: usize,
+    timeout: Option<Duration>,
+) -> MemOpResult<T> {
+    let raw = read_bytes(handle, addr, std::mem::size_of::<T>(), timeout)?;
+    bytemuck::try_pod_read_unaligned::<T>(&raw)
+        .map_err(|e| crate::memop_err!("pod read of {} at {addr:#x}: {e}", type_name::<T>()).into())
+}
+
 pub fn read_value<T: ZholTyped<T>>(
     hook: &ZholHook,
     address: usize,
@@ -39,7 +56,7 @@ pub fn read_value<T: ZholTyped<T>>(
     let value = match T::transmute_from(&raw_buffer, hook, &context)? {
         Some(a) => a,
         None => {
-            return Err(anyhow!(
+            return Err(crate::memop_err!(
                 "No data from type \"{}\" while reading from \"{address}\"",
                 type_name::<T>()
             )

@@ -10,7 +10,7 @@ default = ["async"]
 python = ["pyo3"]
 
 [dependencies]
-anyhow = "1.0.99"
+thiserror = "2"
 bytemuck = { version = "1.23.2", features = ["derive"] }
 dynasmrt = "3.2.1"
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optional = true }
@@ -30,6 +30,3 @@ libc = "0.2"
 name = "zhol"
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
-
-[dev-dependencies]
-anyhow = "1"

@@ -35,12 +35,12 @@ fn find_pid_by_exe(name: &str) -> Option<u32> {
     None
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arg = std::env::args().nth(1).unwrap_or_else(|| "WizardGraphicalClient.exe".into());
     let pid = if arg.chars().all(|c| c.is_ascii_digit()) {
         arg.parse()?
     } else {
-        find_pid_by_exe(&arg).ok_or_else(|| anyhow::anyhow!("no process named {arg}"))?
+        find_pid_by_exe(&arg).ok_or_else(|| format!("no process named {arg}"))?
     };
     let exe = if arg.chars().all(|c| c.is_ascii_digit()) {
         "WizardGraphicalClient.exe".to_string()
@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
     let handle = SafeHandle::from_pid(pid)?;
     let t = Some(Duration::from_secs(5));
     let module = module_by_name(&handle, &exe, true, t)?
-        .ok_or_else(|| anyhow::anyhow!("module {exe} not found"))?;
+        .ok_or_else(|| format!("module {exe} not found"))?;
     let lo = module.base;
     let hi = module.base + module.size;
     println!("module {} image: [{lo:#x}, {hi:#x})", module.name);
@@ -66,8 +66,8 @@ fn main() -> anyhow::Result<()> {
             region.addr,
             back.iter().all(|&b| b == 0)
         );
-        anyhow::ensure!(in_image, "allocation fell outside the module image");
-        anyhow::ensure!(back.iter().all(|&b| b == 0), "scratch not zeroed");
+        if !(in_image) { return Err("allocation fell outside the module image".into()); }
+        if !(back.iter().all(|&b| b == 0)) { return Err("scratch not zeroed".into()); }
         std::mem::forget(region); // don't run Drop (free is a no-op anyway)
     }
 
