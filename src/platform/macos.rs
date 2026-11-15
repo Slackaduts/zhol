@@ -45,14 +45,19 @@
 //!
 //! ## Phase status
 //! Phase 1: read / write / region / module discovery / pattern scan — validated
-//! against the live game. Phase 2: cave allocation + the generic hook/RPC engines
-//! (`raw_hook`, `rpc`) now work on macOS too — writes to r-x pages go through
-//! `mach_vm_protect` (the target's loader must carry
-//! `cs.disable-executable-page-protection`, as CrossOver's does). The one
-//! remaining unknown is runtime, not code: whether a cross-process patch to
-//! x86 code is picked up by **Rosetta 2's translation cache** (self-modifying-code
-//! detection) or whether the cached translation keeps running the old bytes — that
-//! only a live hook test can answer.
+//! against the live game. Phase 2: fresh-page allocation (`mach_vm_allocate`) +
+//! protected-page writes (`mach_vm_protect`) + the generic hook/RPC engines.
+//!
+//! Rosetta reality (live-tested): **inline code patching does NOT work** under
+//! Rosetta 2 — a cross-process write to already-translated x86 code is ignored
+//! (Rosetta's self-modifying-code detection only watches the GUEST's own writes,
+//! not external `mach_vm_*`), so `rpc`/`raw_hook`'s inline trampolines don't fire
+//! on macOS. The viable paradigm is **pointer redirection**: overwrite a data
+//! function pointer (IAT/vtable slot) to a freshly `mach_vm_allocate`'d page —
+//! Rosetta has never translated it, so it is translated lazily on first execution,
+//! and a 64-bit pointer reaches it with no rel32 constraint. Allocation here uses
+//! fresh pages for exactly that reason; an in-image "cave" is an AOT-translated
+//! page and does not work.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -67,7 +72,10 @@ use crate::{MemOpError, MemOpResult};
 use mach2::kern_return::KERN_SUCCESS;
 use mach2::port::{mach_port_t, MACH_PORT_NULL};
 use mach2::traps::{mach_task_self, task_for_pid};
-use mach2::vm::{mach_vm_protect, mach_vm_read_overwrite, mach_vm_region_recurse, mach_vm_write};
+use mach2::vm::{
+    mach_vm_allocate, mach_vm_deallocate, mach_vm_protect, mach_vm_read_overwrite,
+    mach_vm_region_recurse, mach_vm_write,
+};
 use mach2::vm_prot::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE};
 use mach2::vm_region::vm_region_submap_info_64;
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t};
@@ -508,267 +516,86 @@ pub fn query_region(
     }
 }
 
-// --- Phase 2: cave allocation (hooks/RPC ride on the generic raw_hook/rpc). ---
-// Mirrors the Linux two-cave model (see platform/unix.rs); duplicated here rather
-// than shared so the validated Linux path is untouched. The pure allocator (Cave,
-// ProcCaves, take) is identical; find_cave is the macOS-specific part, parsing the
-// target PE's section table via Mach reads, and the zero/code writes go through
-// `raw_write` (mach_vm_protect) instead of Linux's `/proc` bypass.
+// --- Phase 2: fresh-page allocation in the target (macOS VirtualAllocEx). ---
+// Unlike the Linux /proc backend (which can't allocate, so carves module-padding
+// caves), macOS has mach_vm_allocate. Fresh pages are the right substrate here for
+// two reasons: (1) Rosetta 2 has never translated them, so injected x86 code is
+// translated lazily on first execution — an in-image "cave" lies in a page Rosetta
+// AOT-translated, so cross-process writes there are ignored; (2) a 64-bit pointer
+// redirect (IAT/vtable hook) reaches them from anywhere, with no rel32 constraint.
+// Inline code patching does not work under Rosetta regardless, so the Linux-style
+// rel32-reachable image cave is not used on macOS.
 
-fn task_read_u16(task: mach_port_t, addr: u64) -> Option<u16> {
-    let mut b = [0u8; 2];
-    task_read_exact(task, addr, &mut b).then(|| u16::from_le_bytes(b))
+/// addr -> size of live target allocations, so free/reclaim can mach_vm_deallocate.
+static ALLOCS: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
+
+fn allocs() -> &'static Mutex<HashMap<u64, u64>> {
+    ALLOCS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn task_read_u32(task: mach_port_t, addr: u64) -> Option<u32> {
-    let mut b = [0u8; 4];
-    task_read_exact(task, addr, &mut b).then(|| u32::from_le_bytes(b))
-}
+/// VM_FLAGS_ANYWHERE: let the kernel choose the address.
+const VM_FLAGS_ANYWHERE: i32 = 0x0001;
 
-/// Read `[addr, addr+size)` tolerating unmapped holes (zero-filled), via Mach —
-/// the same shape as `read_mem`'s slow path, but usable while the cave lock is
-/// held (no `SafeHandle` re-lock).
-fn gather(task: mach_port_t, addr: u64, size: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; size];
-    let end = addr + size as u64;
-    let mut cur = addr;
-    while cur < end {
-        let (rstart, rsize, prot) = match region_at(task, cur) {
-            Some(r) => r,
-            None => break,
-        };
-        if rstart >= end {
-            break;
-        }
-        let rend = rstart + rsize;
-        if prot & VM_PROT_READ != 0 {
-            let from = rstart.max(addr);
-            let to = rend.min(end);
-            if to > from {
-                let s = (from - addr) as usize;
-                let e = (to - addr) as usize;
-                task_read_exact(task, from, &mut buf[s..e]);
-            }
-        }
-        cur = if rend > cur { rend } else { cur + 1 };
+/// Allocate `size` bytes of fresh memory in the target and set `prot`.
+fn vm_alloc(handle: &SafeHandle, size: usize, prot: i32) -> MemOpResult<usize> {
+    let guard = acquire(handle, Some(Duration::from_secs(2)))?;
+    let task = guard.task;
+    let mut addr: mach_vm_address_t = 0;
+    let kr = unsafe { mach_vm_allocate(task, &mut addr, size as mach_vm_size_t, VM_FLAGS_ANYWHERE) };
+    if kr != KERN_SUCCESS {
+        return Err(MemOpError::Os(format!("mach_vm_allocate({size}): kr={kr}")));
     }
-    buf
-}
-
-/// Base of the main `.exe` PE image (the region whose first bytes are `MZ` backed
-/// by a `*.exe` file) in the target.
-fn main_pe_base(task: mach_port_t, pid: u32) -> Option<u64> {
-    let mut cur: u64 = 0;
-    for _ in 0..1_000_000 {
-        let (rstart, rsize, _prot) = match region_at(task, cur) {
-            Some(r) => r,
-            None => break,
-        };
-        if let Some(path) = region_filename(pid, rstart) {
-            if basename(&path).to_lowercase().ends_with(".exe") {
-                let mut mz = [0u8; 2];
-                if task_read_exact(task, rstart, &mut mz) && &mz == b"MZ" {
-                    return Some(rstart);
-                }
-            }
-        }
-        cur = if rstart + rsize > cur { rstart + rsize } else { cur + 1 };
+    let pr = unsafe { mach_vm_protect(task, addr, size as mach_vm_size_t, 0, prot) };
+    if pr != KERN_SUCCESS {
+        unsafe { mach_vm_deallocate(task, addr, size as mach_vm_size_t) };
+        return Err(MemOpError::Os(format!(
+            "mach_vm_protect({prot:#x}) on fresh alloc: kr={pr} (target loader needs \
+             cs.disable-executable-page-protection for RX code pages)"
+        )));
     }
-    None
+    allocs().lock().insert(addr, size as u64);
+    Ok(addr as usize)
 }
 
-/// Smallest trailing-padding run worth treating as a usable cave.
-const MIN_CAVE: u64 = 0x400;
-
-/// Bump allocator over one run of section padding, with a reuse free list.
-/// Identical to the Linux `Cave` (platform/unix.rs).
-struct Cave {
-    next: u64,
-    end: u64,
-    live: HashMap<u64, u64>,
-    free_list: Vec<(u64, u64)>,
-}
-
-impl Cave {
-    fn new(next: u64, end: u64) -> Self {
-        Cave {
-            next,
-            end,
-            live: HashMap::new(),
-            free_list: Vec::new(),
-        }
-    }
-
-    fn take(&mut self, size: usize) -> MemOpResult<u64> {
-        if let Some(i) = self.free_list.iter().position(|&(_, cap)| cap >= size as u64) {
-            let (a, cap) = self.free_list.swap_remove(i);
-            self.live.insert(a, cap);
-            Ok(a)
-        } else {
-            let a = (self.next + 15) & !15;
-            if a + size as u64 > self.end {
-                return Err(MemOpError::Message(format!(
-                    "code cave exhausted: {} bytes left, {} wanted",
-                    self.end.saturating_sub(a),
-                    size
-                )));
-            }
-            self.next = a + size as u64;
-            self.live.insert(a, size as u64);
-            Ok(a)
+/// Deallocate a prior [`vm_alloc`] block (idempotent). Removes the tracking entry
+/// first so the global lock is never held across the per-handle lock.
+fn vm_free(handle: &SafeHandle, addr: usize) {
+    let sz = allocs().lock().remove(&(addr as u64));
+    if let Some(sz) = sz {
+        if let Some(g) = handle.acquire_with_timeout(Some(Duration::from_secs(2))) {
+            unsafe { mach_vm_deallocate(g.task, addr as mach_vm_address_t, sz as mach_vm_size_t) };
         }
     }
 }
 
-/// Per-pid writable DATA cave + executable CODE cave (see the Linux `ProcCaves`).
-#[derive(Default)]
-struct ProcCaves {
-    data: Option<Cave>,
-    code: Option<Cave>,
-}
-
-static CAVES: OnceLock<Mutex<HashMap<u32, ProcCaves>>> = OnceLock::new();
-
-fn caves() -> &'static Mutex<HashMap<u32, ProcCaves>> {
-    CAVES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Carve a cave from the target PE's section padding (same strategy as Linux):
-/// `writable=true` → the alignment gap after a writable section's content (safe
-/// scratch the target can write); `writable=false` → trailing zero padding of the
-/// executable sections (`.text` slack, within rel32 of code). Reads via Mach.
-fn find_cave(task: mach_port_t, pid: u32, writable: bool) -> MemOpResult<Cave> {
-    let base = main_pe_base(task, pid)
-        .ok_or_else(|| MemOpError::Message("no .exe PE image mapped in target".into()))?;
-
-    let lfanew = task_read_u32(task, base + 0x3C)
-        .ok_or_else(|| MemOpError::Message("cannot read e_lfanew".into()))? as u64;
-    let mut sig = [0u8; 4];
-    if !task_read_exact(task, base + lfanew, &mut sig) || &sig != b"PE\0\0" {
-        return Err(MemOpError::Message("main module is not a PE".into()));
-    }
-    let num_sections = task_read_u16(task, base + lfanew + 6)
-        .ok_or_else(|| MemOpError::Message("cannot read NumberOfSections".into()))?;
-    let opt_hdr_size = task_read_u16(task, base + lfanew + 20)
-        .ok_or_else(|| MemOpError::Message("cannot read SizeOfOptionalHeader".into()))?;
-    let sec_table = base + lfanew + 24 + opt_hdr_size as u64;
-
-    const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
-    const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
-    let want = if writable {
-        IMAGE_SCN_MEM_WRITE
-    } else {
-        IMAGE_SCN_MEM_EXECUTE
-    };
-
-    let mut secs: Vec<(u64, u64, bool)> = Vec::new();
-    for i in 0..num_sections as u64 {
-        let sh = sec_table + i * 40;
-        let vsize = task_read_u32(task, sh + 8).unwrap_or(0) as u64;
-        let vaddr = task_read_u32(task, sh + 12).unwrap_or(0) as u64;
-        let chars = task_read_u32(task, sh + 36).unwrap_or(0);
-        if vsize == 0 {
-            continue;
-        }
-        secs.push((vaddr, vsize, chars & want != 0));
-    }
-    secs.sort_by_key(|s| s.0);
-
-    let mut best: Option<(u64, u64)> = None;
-    for (idx, &(vaddr, vsize, matches)) in secs.iter().enumerate() {
-        if !matches {
-            continue;
-        }
-        let sec_start = base + vaddr;
-        let content_end = sec_start + vsize;
-        let span_end = match secs.get(idx + 1) {
-            Some(&(next_vaddr, _, _)) => base + next_vaddr,
-            None => content_end,
-        };
-        let pad_start = if writable {
-            content_end
-        } else {
-            let span_len = (span_end - sec_start) as usize;
-            let data = gather(task, sec_start, span_len);
-            match data.iter().rposition(|&b| b != 0) {
-                Some(i) => sec_start + i as u64 + 1,
-                None => sec_start,
-            }
-        };
-        let run = span_end.saturating_sub(pad_start);
-        if run >= MIN_CAVE && best.map_or(true, |(s, e)| (e - s) < run) {
-            best = Some((pad_start, span_end));
-        }
-    }
-
-    let (start, end) = best.ok_or_else(|| {
-        MemOpError::Message(format!(
-            "no {} padding >= {MIN_CAVE:#x} bytes found for a cave",
-            if writable { "writable-section" } else { "executable-section" }
-        ))
-    })?;
-    Ok(Cave::new(start, end))
-}
-
-/// Allocate writable DATA scratch (buffers the target writes into, the RPC `done`
-/// byte). Carved from a writable section's padding, so plain writes land.
+/// Allocate fresh writable DATA scratch (the RPC `done` byte, hook var buffers).
 pub fn alloc(handle: &SafeHandle, size: usize) -> MemOpResult<usize> {
-    let guard = acquire(handle, Some(Duration::from_secs(2)))?;
-    let (task, pid) = (guard.task, guard.pid);
-    let mut map = caves().lock();
-    let pc = map.entry(pid).or_default();
-    if pc.data.is_none() {
-        pc.data = Some(find_cave(task, pid, true)?);
-    }
-    let addr = pc.data.as_mut().unwrap().take(size)?;
-    raw_write(task, addr, &vec![0u8; size])?;
-    Ok(addr as usize)
+    vm_alloc(handle, size, VM_PROT_READ | VM_PROT_WRITE)
 }
 
-/// Allocate EXECUTABLE CODE scratch (injected code, trampolines). Carved from
-/// `.text` slack, or the region supplied via [`register_cave`] (wizwalker's
-/// autobot). Writes go through `raw_write`, which flips protection for the r-x
-/// page.
+/// Allocate fresh EXECUTABLE scratch (injected code, trampolines). RWX so we can
+/// write then execute; Rosetta translates it lazily on first execution, and a
+/// 64-bit pointer redirect reaches it from anywhere.
 pub fn alloc_code(handle: &SafeHandle, size: usize) -> MemOpResult<usize> {
-    let guard = acquire(handle, Some(Duration::from_secs(2)))?;
-    let (task, pid) = (guard.task, guard.pid);
-    let mut map = caves().lock();
-    let pc = map.entry(pid).or_default();
-    if pc.code.is_none() {
-        pc.code = Some(find_cave(task, pid, false)?);
-    }
-    let addr = pc.code.as_mut().unwrap().take(size)?;
-    raw_write(task, addr, &vec![0u8; size])?;
-    Ok(addr as usize)
+    vm_alloc(handle, size, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)
 }
 
-/// No-op (parity with Linux): reclamation is explicit via [`reclaim_cave`].
-pub fn free(_handle: &SafeHandle, _addr: usize, _size: usize) -> MemOpResult<()> {
+/// Free a block (parity with Linux's no-op signature, but macOS actually frees).
+pub fn free(handle: &SafeHandle, addr: usize, _size: usize) -> MemOpResult<()> {
+    vm_free(handle, addr);
     Ok(())
 }
 
-/// Return a cave block for reuse. Idempotent; checks both caves.
+/// Reclaim a block — deallocates the fresh page. Idempotent.
 pub fn reclaim_cave(handle: &SafeHandle, addr: usize) -> MemOpResult<()> {
-    let guard = acquire(handle, Some(Duration::from_secs(2)))?;
-    let pid = guard.pid;
-    let mut map = caves().lock();
-    if let Some(pc) = map.get_mut(&pid) {
-        for cave in [pc.data.as_mut(), pc.code.as_mut()].into_iter().flatten() {
-            if let Some(cap) = cave.live.remove(&(addr as u64)) {
-                cave.free_list.push((addr as u64, cap));
-                break;
-            }
-        }
-    }
+    vm_free(handle, addr);
     Ok(())
 }
 
-/// Register an explicit executable CODE cave (wizwalker's autobot), overriding the
-/// auto-discovered one; the data cave is untouched.
-pub fn register_cave(handle: &SafeHandle, start: usize, size: usize) -> MemOpResult<()> {
-    let guard = acquire(handle, Some(Duration::from_secs(2)))?;
-    caves().lock().entry(guard.pid).or_default().code =
-        Some(Cave::new(start as u64, (start + size) as u64));
+/// No-op on macOS: allocation uses fresh mach_vm_allocate pages, not a registered
+/// image cave. wizwalker still calls this (to hand over its autobot); succeeding
+/// keeps its hook lifecycle unimpaired while we simply ignore the hint.
+pub fn register_cave(_handle: &SafeHandle, _start: usize, _size: usize) -> MemOpResult<()> {
     Ok(())
 }
 
