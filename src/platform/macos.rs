@@ -412,9 +412,28 @@ fn pe_image_size(task: mach_port_t, base: u64) -> Option<usize> {
 /// `wine64-preloader` into the temp dir under the game's exe name — without this,
 /// `module_by_name("WizardGraphicalClient.exe")` returns the preloader, not the
 /// game image.
+/// Per-pid cache of enumerated modules. `enum_modules` walks tens of thousands of
+/// VM regions calling `proc_regionfilename` (~1.5 s against a live Wine game), and
+/// wizwalker resolves a module by name before EVERY pattern scan — so one
+/// `activate_hooks` otherwise pays that walk ~8×. Keyed by pid, so a restarted game
+/// (new pid) is re-enumerated; the game's modules are all loaded by the time hooks
+/// install, so a cached list stays complete for the process lifetime.
+static MODULE_CACHE: OnceLock<Mutex<HashMap<u32, Vec<Module>>>> = OnceLock::new();
+
+fn module_cache() -> &'static Mutex<HashMap<u32, Vec<Module>>> {
+    MODULE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 pub fn enum_modules(handle: &SafeHandle, timeout: Option<Duration>) -> MemOpResult<Vec<Module>> {
     let guard = acquire(handle, timeout)?;
     let (task, pid) = (guard.task, guard.pid);
+
+    {
+        let cache = module_cache().lock();
+        if let Some(cached) = cache.get(&pid) {
+            return Ok(cached.clone());
+        }
+    }
 
     // Per backing path: (min mapping start, max mapping end, first MZ region seen).
     let mut order: Vec<String> = Vec::new();
@@ -469,7 +488,9 @@ pub fn enum_modules(handle: &SafeHandle, timeout: Option<Duration>) -> MemOpResu
             None => by_name.push((name, module, is_pe)),
         }
     }
-    Ok(by_name.into_iter().map(|(_, m, _)| m).collect())
+    let result: Vec<Module> = by_name.into_iter().map(|(_, m, _)| m).collect();
+    module_cache().lock().insert(pid, result.clone());
+    Ok(result)
 }
 
 /// Query the region containing `addr`. If `addr` falls in a hole, reports an
