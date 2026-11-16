@@ -583,40 +583,118 @@ pub fn alloc_code(handle: &SafeHandle, size: usize) -> MemOpResult<usize> {
 /// Largest signed rel32 displacement, with headroom under the 2 GiB limit so an
 /// `E9 rel32` plant and its return jump both reach.
 const REL32_REACH: u64 = 0x7000_0000;
+/// VM_FLAGS_FIXED: allocate at exactly the requested address (fails if occupied).
+const VM_FLAGS_FIXED: i32 = 0x0000;
+/// Allocation granularity on Apple Silicon is 16 KiB even under Rosetta.
+const VM_GRAN: u64 = 0x4000;
+
+/// Scan upward from `start` for the lowest `VM_GRAN`-aligned address with `need`
+/// free bytes above it, stopping at `limit`. Reuses [`region_at`] (returns the
+/// region at/above an address) to find gaps between mappings.
+fn gap_above(task: mach_port_t, start: u64, limit: u64, need: u64) -> Option<u64> {
+    let mut cursor = (start + VM_GRAN - 1) & !(VM_GRAN - 1);
+    while cursor + need <= limit {
+        match region_at(task, cursor) {
+            // Nothing mapped at/above cursor: [cursor, limit) is all free.
+            None => return Some(cursor),
+            Some((r_start, r_size, _)) => {
+                // A gap [cursor, r_start) big enough starts right here.
+                if r_start >= cursor + need {
+                    return Some(cursor);
+                }
+                // Otherwise cursor is inside or just below this region; skip past it.
+                let next = (r_start + r_size).max(cursor + VM_GRAN);
+                cursor = (next + VM_GRAN - 1) & !(VM_GRAN - 1);
+            }
+        }
+    }
+    None
+}
 
 /// Allocate fresh RWX code memory within rel32 (±2 GiB) of `near`, so a 5-byte
 /// `E9 rel32` jump planted at `near` reaches it (and the cave's return jump reaches
 /// back). An inline hook needs this: unlike a pointer-redirect detour, the jump at
-/// the patched site is rel32. `mach_vm_allocate(ANYWHERE)` uses the requested
-/// address as the search floor, so it returns the lowest free block at/above
-/// `near` — normally just past the module image, well within reach. The cave page
-/// is fresh, so its code is translated lazily on first execution (no W^X needed);
-/// only the jump into it (a write to already-translated `.text`) needs `write_code`.
+/// the patched site is rel32.
+///
+/// `mach_vm_allocate(ANYWHERE)` ignores the address as a hint on macOS (it returns
+/// the lowest free fit in the whole task, typically gigabytes away), so instead we
+/// walk the target's VM map for a free gap within reach and allocate `FIXED` there.
+/// The nearest gap at/above the module image is preferred (clear of Wine's low
+/// heap); a gap below `near` is the fallback. The cave page is fresh, so its code
+/// is translated lazily on first execution (no W^X needed); only the jump into it
+/// (a write to already-translated `.text`) needs `write_code`.
 pub fn alloc_code_near(handle: &SafeHandle, size: usize, near: usize) -> MemOpResult<usize> {
     let guard = acquire(handle, Some(Duration::from_secs(2)))?;
     let task = guard.task;
-    let mut addr: mach_vm_address_t = near as mach_vm_address_t;
-    let kr = unsafe { mach_vm_allocate(task, &mut addr, size as mach_vm_size_t, VM_FLAGS_ANYWHERE) };
-    if kr != KERN_SUCCESS {
-        return Err(MemOpError::Os(format!("mach_vm_allocate_near({size}): kr={kr}")));
+    let need = ((size as u64 + VM_GRAN - 1) & !(VM_GRAN - 1)).max(VM_GRAN);
+    let near = near as u64;
+    let hi = near.saturating_add(REL32_REACH);
+    let lo = near.saturating_sub(REL32_REACH).max(0x10000);
+
+    // Prefer the nearest gap at/above `near`; else the highest gap below it.
+    let mut candidate = gap_above(task, near, hi, need);
+    if candidate.is_none() {
+        let mut best: Option<u64> = None;
+        let mut c = (lo + VM_GRAN - 1) & !(VM_GRAN - 1);
+        while c + need <= near {
+            match region_at(task, c) {
+                None => {
+                    let slot = ((near - need) & !(VM_GRAN - 1)).max(c);
+                    best = Some(slot);
+                    break;
+                }
+                Some((r_start, r_size, _)) => {
+                    if r_start >= c + need {
+                        let top = ((r_start.min(near) - need) & !(VM_GRAN - 1)).max(c);
+                        best = Some(top);
+                    }
+                    let next = (r_start + r_size).max(c + VM_GRAN);
+                    c = (next + VM_GRAN - 1) & !(VM_GRAN - 1);
+                }
+            }
+        }
+        candidate = best;
     }
-    let delta = (addr as i64 - near as i64).unsigned_abs();
-    if delta > REL32_REACH {
-        unsafe { mach_vm_deallocate(task, addr, size as mach_vm_size_t) };
+
+    let mut slot = candidate.ok_or_else(|| {
+        MemOpError::Os(format!("no free gap within rel32 of {near:#x}"))
+    })?;
+
+    // FIXED allocation at the chosen slot; nudge up a few granules on a race loss.
+    let mut addr: mach_vm_address_t;
+    let mut tries = 0;
+    loop {
+        addr = slot as mach_vm_address_t;
+        let kr =
+            unsafe { mach_vm_allocate(task, &mut addr, need as mach_vm_size_t, VM_FLAGS_FIXED) };
+        if kr == KERN_SUCCESS {
+            break;
+        }
+        tries += 1;
+        if tries > 8 || slot + need + VM_GRAN > hi {
+            return Err(MemOpError::Os(format!(
+                "FIXED alloc near {near:#x} failed after {tries} tries: kr={kr}"
+            )));
+        }
+        slot += VM_GRAN;
+    }
+
+    if (addr as i64 - near as i64).unsigned_abs() > REL32_REACH {
+        unsafe { mach_vm_deallocate(task, addr, need as mach_vm_size_t) };
         return Err(MemOpError::Os(format!(
-            "no free page within rel32 of {near:#x} (nearest free {addr:#x}, {delta:#x} away)"
+            "near-cave {addr:#x} out of rel32 of {near:#x}"
         )));
     }
     let prot = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
-    let pr = unsafe { mach_vm_protect(task, addr, size as mach_vm_size_t, 0, prot) };
+    let pr = unsafe { mach_vm_protect(task, addr, need as mach_vm_size_t, 0, prot) };
     if pr != KERN_SUCCESS {
-        unsafe { mach_vm_deallocate(task, addr, size as mach_vm_size_t) };
+        unsafe { mach_vm_deallocate(task, addr, need as mach_vm_size_t) };
         return Err(MemOpError::Os(format!(
             "mach_vm_protect(RWX) on near-cave: kr={pr} (target loader needs \
              cs.disable-executable-page-protection)"
         )));
     }
-    allocs().lock().insert(addr, size as u64);
+    allocs().lock().insert(addr, need);
     Ok(addr as usize)
 }
 
