@@ -132,6 +132,15 @@ impl Process {
             .map_err(err)
     }
 
+    /// Apply many code patches in one call: a list of (address, bytes). On macOS a
+    /// single guest W^X RPC applies them all (one round trip for a whole batch of
+    /// hook installs); elsewhere each is a plain write.
+    fn write_code_batch(&self, py: Python<'_>, patches: Vec<(usize, Vec<u8>)>) -> PyResult<()> {
+        let handle = self.handle.clone();
+        py.allow_threads(move || crate::rpc::write_code_batch(&handle, &patches))
+            .map_err(err)
+    }
+
     /// Read a single scalar of `dtype` at `addr`, returning a Python int/float/
     /// bool. No hook required (goes through the hook-free `read_pod` path).
     fn read_typed(&self, py: Python<'_>, addr: usize, dtype: DType) -> PyResult<PyObject> {

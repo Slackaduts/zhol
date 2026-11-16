@@ -459,14 +459,14 @@ fn wx_funcs(handle: &SafeHandle) -> MemOpResult<(u64, u64)> {
     Ok((vp, fic))
 }
 
-/// Win64 shellcode: VirtualProtect(addr,n,PAGE_READWRITE,&old) -> write `bytes` ->
-/// VirtualProtect(addr,n,old,&old2) -> FlushInstructionCache(-1,addr,n). The
-/// RW(non-exec) -> RX toggle is the W^X transition Rosetta re-translates on.
+/// Emit one patch's W^X sequence into `c` (no prologue/epilogue): VirtualProtect
+/// (addr,n,PAGE_READWRITE,&old@rsp+0x20) -> write `bytes` -> VirtualProtect(addr,n,
+/// old,&old2@rsp+0x28) -> FlushInstructionCache(-1,addr,n). The RW(non-exec) -> RX
+/// toggle is the W^X transition Rosetta re-translates on. The &old slots are reused
+/// per patch (the old value is consumed by the restore before the next patch).
 #[cfg(target_os = "macos")]
-fn build_wx_shellcode(addr: u64, bytes: &[u8], vp: u64, fic: u64) -> Vec<u8> {
+fn emit_wx_patch(c: &mut Vec<u8>, addr: u64, bytes: &[u8], vp: u64, fic: u64) {
     let n = bytes.len() as u32;
-    let mut c: Vec<u8> = Vec::new();
-    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x48]); // sub rsp,0x48
     c.extend_from_slice(&[0x48, 0xB9]); // mov rcx, addr
     c.extend_from_slice(&addr.to_le_bytes());
     c.push(0xBA); // mov edx, n
@@ -479,7 +479,7 @@ fn build_wx_shellcode(addr: u64, bytes: &[u8], vp: u64, fic: u64) -> Vec<u8> {
     c.extend_from_slice(&[0x48, 0xB8]); // mov rax, addr
     c.extend_from_slice(&addr.to_le_bytes());
     for (i, b) in bytes.iter().enumerate() {
-        c.extend_from_slice(&[0xC6, 0x40, i as u8, *b]); // mov byte [rax+i], b
+        c.extend_from_slice(&[0xC6, 0x40, i as u8, *b]); // mov byte [rax+i], b  (i<128)
     }
     c.extend_from_slice(&[0x48, 0xB9]); // mov rcx, addr
     c.extend_from_slice(&addr.to_le_bytes());
@@ -498,8 +498,27 @@ fn build_wx_shellcode(addr: u64, bytes: &[u8], vp: u64, fic: u64) -> Vec<u8> {
     c.extend_from_slice(&[0x48, 0xB8]); // mov rax, FlushInstructionCache
     c.extend_from_slice(&fic.to_le_bytes());
     c.extend_from_slice(&[0xFF, 0xD0]); // call rax
-    c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x48]); // add rsp,0x48
-    c.push(0xC3); // ret
+}
+
+/// One patch, wrapped in a stack frame (shadow + two &old slots) and `ret`.
+#[cfg(target_os = "macos")]
+fn build_wx_shellcode(addr: u64, bytes: &[u8], vp: u64, fic: u64) -> Vec<u8> {
+    let mut c: Vec<u8> = vec![0x48, 0x83, 0xEC, 0x48]; // sub rsp,0x48
+    emit_wx_patch(&mut c, addr, bytes, vp, fic);
+    c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x48, 0xC3]); // add rsp,0x48 ; ret
+    c
+}
+
+/// Many patches applied in ONE shellcode (one stack frame, each patch's full W^X
+/// sequence in sequence, one `ret`) — so a whole batch of hook installs costs a
+/// SINGLE RPC round trip instead of one per site.
+#[cfg(target_os = "macos")]
+fn build_wx_batch_shellcode(patches: &[(usize, Vec<u8>)], vp: u64, fic: u64) -> Vec<u8> {
+    let mut c: Vec<u8> = vec![0x48, 0x83, 0xEC, 0x48]; // sub rsp,0x48
+    for (addr, bytes) in patches {
+        emit_wx_patch(&mut c, *addr as u64, bytes, vp, fic);
+    }
+    c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x48, 0xC3]); // add rsp,0x48 ; ret
     c
 }
 
@@ -529,10 +548,48 @@ pub fn write_code(handle: &SafeHandle, addr: usize, bytes: &[u8]) -> MemOpResult
     Ok(())
 }
 
+/// Apply many code patches in ONE guest W^X RPC (macOS). Installing a batch of
+/// inline hooks this way costs a single RPC round trip instead of one per site —
+/// the dominant attach cost when the target is throttled in the background.
+#[cfg(target_os = "macos")]
+pub fn write_code_batch(handle: &SafeHandle, patches: &[(usize, Vec<u8>)]) -> MemOpResult<()> {
+    let patches: Vec<(usize, Vec<u8>)> = patches
+        .iter()
+        .filter(|(_, b)| !b.is_empty())
+        .cloned()
+        .collect();
+    if patches.is_empty() {
+        return Ok(());
+    }
+    if patches.iter().any(|(_, b)| b.len() > 127) {
+        return Err(MemOpError::Message(
+            "write_code_batch: each patch must be ≤127 bytes".into(),
+        ));
+    }
+    let (vp, fic) = wx_funcs(handle)?;
+    let shell = build_wx_batch_shellcode(&patches, vp, fic);
+    let ran = rpc_via_hijack(handle, 0, &shell, 0, 0, Duration::from_secs(5))?;
+    if !ran {
+        return Err(MemOpError::Message(
+            "write_code_batch: guest W^X RPC did not run within timeout".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Plain memory write on non-macOS platforms (no Rosetta translation to invalidate).
 #[cfg(not(target_os = "macos"))]
 pub fn write_code(handle: &SafeHandle, addr: usize, bytes: &[u8]) -> MemOpResult<()> {
     write_bytes(handle, addr, bytes, T)?;
+    Ok(())
+}
+
+/// Plain per-patch writes on non-macOS platforms.
+#[cfg(not(target_os = "macos"))]
+pub fn write_code_batch(handle: &SafeHandle, patches: &[(usize, Vec<u8>)]) -> MemOpResult<()> {
+    for (addr, bytes) in patches {
+        write_bytes(handle, *addr, bytes, T)?;
+    }
     Ok(())
 }
 
