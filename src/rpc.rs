@@ -253,6 +253,51 @@ const RPC_CANDIDATE_IMPORTS: &[&str] = &[
     "GetSystemTimeAsFileTime",
 ];
 
+/// Per-pid cache of resolved (import slot, original pointer) pairs. Enumerating
+/// modules + parsing the import table is the slow part of an RPC (~seconds); the
+/// slots are stable per process and each is always restored to its original, so
+/// caching is safe and keeps freecam toggles snappy.
+#[cfg(target_os = "macos")]
+static RPC_SLOTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u32, Vec<(usize, u64)>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn macos_import_slots(handle: &SafeHandle) -> MemOpResult<Vec<(usize, u64)>> {
+    use crate::process::module::{find_import_slot, get_named_modules};
+
+    // pid — scoped so the guard drops before the re-locking reads below.
+    let pid = {
+        let g = handle.acquire_with_timeout(T).ok_or(MemOpError::Timeout(T))?;
+        g.pid
+    };
+
+    let cache = RPC_SLOTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(v) = cache.lock().unwrap().get(&pid) {
+        return Ok(v.clone());
+    }
+
+    let exe = get_named_modules(handle, T)?
+        .into_iter()
+        .find(|m| m.name.to_lowercase().ends_with(".exe"))
+        .ok_or_else(|| MemOpError::Message("no .exe module in target".into()))?;
+
+    let mut v: Vec<(usize, u64)> = Vec::new();
+    for name in RPC_CANDIDATE_IMPORTS {
+        if let Some(slot) = find_import_slot(handle, exe.base, name)? {
+            let ob = read_bytes(handle, slot, 8, T)?;
+            v.push((slot, u64::from_le_bytes(ob[..8].try_into().unwrap())));
+        }
+    }
+    if v.is_empty() {
+        return Err(MemOpError::Message(
+            "no redirectable hot import found in target".into(),
+        ));
+    }
+    cache.lock().unwrap().insert(pid, v.clone());
+    Ok(v)
+}
+
 #[cfg(target_os = "macos")]
 pub fn rpc_via_hijack(
     handle: &SafeHandle,
@@ -262,43 +307,30 @@ pub fn rpc_via_hijack(
     _done_addr: usize,
     timeout: Duration,
 ) -> MemOpResult<bool> {
-    use crate::process::module::{find_import_slot, get_named_modules};
-
     if shellcode.is_empty() {
         return Err(MemOpError::Message("empty shellcode".into()));
     }
 
-    let exe = get_named_modules(handle, T)?
-        .into_iter()
-        .find(|m| m.name.to_lowercase().ends_with(".exe"))
-        .ok_or_else(|| MemOpError::Message("no .exe module in target".into()))?;
+    // Resolve the candidate import slots (and their original pointers) once per
+    // process and cache them: enumerating 179 modules + parsing the import table on
+    // every RPC cost ~5-8s, which would make a freecam toggle feel frozen. The IAT
+    // slots are stable for a process, and we always restore each slot to its
+    // original, so a cached original stays valid across calls.
+    let slots = macos_import_slots(handle)?;
 
     let done = platform::alloc(handle, 8)?;
     write_bytes(handle, done, &[0u8; 8], T)?;
     let shell = platform::alloc_code(handle, shellcode.len())?;
     write_bytes(handle, shell, shellcode, T)?;
 
-    // Redirect every present candidate slot to its own detour trampoline.
+    // Redirect every candidate slot to its own detour trampoline.
     let mut hooked: Vec<(usize, u64, usize)> = Vec::new(); // (slot, original, tramp)
-    for name in RPC_CANDIDATE_IMPORTS {
-        let slot = match find_import_slot(handle, exe.base, name)? {
-            Some(s) => s,
-            None => continue,
-        };
-        let ob = read_bytes(handle, slot, 8, T)?;
-        let original = u64::from_le_bytes(ob[..8].try_into().unwrap());
+    for &(slot, original) in &slots {
         let tramp = platform::alloc_code(handle, 128)?;
         let code = build_detour(done as u64, shell as u64, original);
         write_bytes(handle, tramp, &code, T)?;
         write_bytes(handle, slot, &(tramp as u64).to_le_bytes(), T)?;
         hooked.push((slot, original, tramp));
-    }
-    if hooked.is_empty() {
-        let _ = platform::reclaim_cave(handle, shell);
-        let _ = platform::reclaim_cave(handle, done);
-        return Err(MemOpError::Message(
-            "no redirectable hot import found in target".into(),
-        ));
     }
 
     // Poll the done byte up to the timeout.
