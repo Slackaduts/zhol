@@ -20,16 +20,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pid: u32 = std::env::args().nth(1).ok_or("usage: rpcmac <pid> [secs]")?.parse()?;
     let secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(10);
 
+    // Number of consecutive RPCs in one process (default 2): the key regression is
+    // a SECOND RPC failing because a reused page address hit a stale Rosetta
+    // translation. With the leak fix both must return ran=true.
+    let iters: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(2);
+
     println!("attaching to pid {pid}");
     let h = SafeHandle::from_pid(pid)?;
 
-    // site / orig_len / done_addr are ignored on macOS; payload is a bare `ret`.
-    let ran = rpc_via_hijack(&h, 0, &[0xC3], 10, 0, Duration::from_secs(secs))?;
+    let mut all_ok = true;
+    for i in 1..=iters {
+        // site / orig_len / done_addr are ignored on macOS; payload is a bare `ret`.
+        let ran = rpc_via_hijack(&h, 0, &[0xC3], 10, 0, Duration::from_secs(secs))?;
+        println!("RPC #{i}: ran={ran}");
+        all_ok &= ran;
+    }
 
-    if ran {
-        println!("RESULT: ran=true — library rpc_via_hijack executed the payload under Rosetta via pointer redirect. start_thread/freecam path viable.");
+    if all_ok {
+        println!("RESULT: all {iters} RPCs ran — repeated pointer-redirect RPC works in one process (leak fix OK).");
     } else {
-        println!("RESULT: ran=false — payload not executed within {secs}s (no hot import hit?). Slots restored.");
+        println!("RESULT: at least one RPC did NOT run within {secs}s each.");
     }
     Ok(())
 }

@@ -312,16 +312,21 @@ pub fn rpc_via_hijack(
         }
     }
 
-    // Restore all slots (stop routing through us), let in-flight calls drain, free.
+    // Restore every redirected slot so the game stops routing through us.
     for &(slot, original, _) in &hooked {
         let _ = write_bytes(handle, slot, &original.to_le_bytes(), T);
     }
-    std::thread::sleep(Duration::from_millis(50));
-    for &(_, _, tramp) in &hooked {
-        let _ = platform::reclaim_cave(handle, tramp);
-    }
-    let _ = platform::reclaim_cave(handle, shell);
-    let _ = platform::reclaim_cave(handle, done);
+
+    // IMPORTANT: do NOT free the executed pages (shellcode + trampolines) or the
+    // done byte. Rosetta 2 caches translations BY ADDRESS; if a later RPC's
+    // mach_vm_allocate reused a freed trampoline address, Rosetta would run the
+    // stale translation of the PREVIOUS detour (writing the previous, now-freed
+    // done byte) and the new RPC's done would never flip — so a second RPC in the
+    // same process (e.g. freecam ON then OFF) would silently time out. Leaking
+    // these small pages guarantees every RPC gets a never-before-translated
+    // address. They're a few pages each; a whole session's toggles are negligible.
+    // (The caller's shellcode *staging* block is separate and still freed by the
+    // caller — it is never executed, so no stale translation applies to it.)
 
     Ok(ran)
 }
