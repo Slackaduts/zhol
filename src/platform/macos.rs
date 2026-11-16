@@ -580,6 +580,46 @@ pub fn alloc_code(handle: &SafeHandle, size: usize) -> MemOpResult<usize> {
     vm_alloc(handle, size, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)
 }
 
+/// Largest signed rel32 displacement, with headroom under the 2 GiB limit so an
+/// `E9 rel32` plant and its return jump both reach.
+const REL32_REACH: u64 = 0x7000_0000;
+
+/// Allocate fresh RWX code memory within rel32 (±2 GiB) of `near`, so a 5-byte
+/// `E9 rel32` jump planted at `near` reaches it (and the cave's return jump reaches
+/// back). An inline hook needs this: unlike a pointer-redirect detour, the jump at
+/// the patched site is rel32. `mach_vm_allocate(ANYWHERE)` uses the requested
+/// address as the search floor, so it returns the lowest free block at/above
+/// `near` — normally just past the module image, well within reach. The cave page
+/// is fresh, so its code is translated lazily on first execution (no W^X needed);
+/// only the jump into it (a write to already-translated `.text`) needs `write_code`.
+pub fn alloc_code_near(handle: &SafeHandle, size: usize, near: usize) -> MemOpResult<usize> {
+    let guard = acquire(handle, Some(Duration::from_secs(2)))?;
+    let task = guard.task;
+    let mut addr: mach_vm_address_t = near as mach_vm_address_t;
+    let kr = unsafe { mach_vm_allocate(task, &mut addr, size as mach_vm_size_t, VM_FLAGS_ANYWHERE) };
+    if kr != KERN_SUCCESS {
+        return Err(MemOpError::Os(format!("mach_vm_allocate_near({size}): kr={kr}")));
+    }
+    let delta = (addr as i64 - near as i64).unsigned_abs();
+    if delta > REL32_REACH {
+        unsafe { mach_vm_deallocate(task, addr, size as mach_vm_size_t) };
+        return Err(MemOpError::Os(format!(
+            "no free page within rel32 of {near:#x} (nearest free {addr:#x}, {delta:#x} away)"
+        )));
+    }
+    let prot = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
+    let pr = unsafe { mach_vm_protect(task, addr, size as mach_vm_size_t, 0, prot) };
+    if pr != KERN_SUCCESS {
+        unsafe { mach_vm_deallocate(task, addr, size as mach_vm_size_t) };
+        return Err(MemOpError::Os(format!(
+            "mach_vm_protect(RWX) on near-cave: kr={pr} (target loader needs \
+             cs.disable-executable-page-protection)"
+        )));
+    }
+    allocs().lock().insert(addr, size as u64);
+    Ok(addr as usize)
+}
+
 /// Free a block (parity with Linux's no-op signature, but macOS actually frees).
 pub fn free(handle: &SafeHandle, addr: usize, _size: usize) -> MemOpResult<()> {
     vm_free(handle, addr);

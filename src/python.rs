@@ -265,6 +265,27 @@ impl Process {
         Ok(addr)
     }
 
+    /// Allocate `size` bytes of EXECUTABLE code memory reachable by a 5-byte
+    /// `E9 rel32` jump from `near` (an inline hook's patch site). On macOS the cave
+    /// is placed within ±2 GiB of `near` so the jump — and the cave's return jump —
+    /// reach; the fresh page is translated lazily on first execution. On other
+    /// platforms `near` is advisory (their caves are already reachable) and a normal
+    /// executable allocation is returned.
+    fn allocate_near(&self, size: usize, near: usize) -> PyResult<usize> {
+        #[cfg(target_os = "macos")]
+        {
+            platform::alloc_code_near(&self.handle, size, near).map_err(err)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = near;
+            let region = allocate_memory(&self.handle, size).map_err(err)?;
+            let addr = region.addr;
+            std::mem::forget(region);
+            Ok(addr)
+        }
+    }
+
     /// Register an explicit code-cave arena (e.g. wizwalker's autobot).
     fn register_cave(&self, start: usize, size: usize) -> PyResult<()> {
         platform::register_cave(&self.handle, start, size).map_err(err)
