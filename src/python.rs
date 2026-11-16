@@ -121,6 +121,17 @@ impl Process {
         zwrite(&self.handle, addr, data, T).map_err(err)
     }
 
+    /// Write `data` into EXECUTABLE memory so the patch takes effect (hook jumps,
+    /// je-NOPs, and their restores). Plain write on Windows/Linux; on macOS a guest
+    /// W^X write via the one-shot RPC, since Rosetta ignores external writes to
+    /// already-translated code. Patch must be ≤127 bytes of whole instructions.
+    fn write_code(&self, py: Python<'_>, addr: usize, data: &[u8]) -> PyResult<()> {
+        let handle = self.handle.clone();
+        let bytes = data.to_vec();
+        py.allow_threads(move || crate::rpc::write_code(&handle, addr, &bytes))
+            .map_err(err)
+    }
+
     /// Read a single scalar of `dtype` at `addr`, returning a Python int/float/
     /// bool. No hook required (goes through the hook-free `read_pod` path).
     fn read_typed(&self, py: Python<'_>, addr: usize, dtype: DType) -> PyResult<PyObject> {

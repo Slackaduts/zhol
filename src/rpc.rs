@@ -363,6 +363,179 @@ pub fn rpc_via_hijack(
     Ok(ran)
 }
 
+// --- Guest W^X code writes (macOS / Rosetta) -------------------------------
+//
+// Under Rosetta 2, a cross-process `mach_vm_write` to an already-translated x86
+// page is invisible to the translator, so an inline patch written from outside
+// never takes effect. Rosetta only re-translates a page when the GUEST performs
+// a W^X transition on it (make it writable+non-executable, write, make it
+// executable again) — the same JIT-coherency path browsers use. Live-proven:
+// patching a code site this way froze/unfroze the game's movement update, while
+// both an external write and a guest RWX write (no W^X transition) did nothing.
+//
+// `write_code` builds that `VirtualProtect(RW) -> write -> VirtualProtect(RX) ->
+// FlushInstructionCache` sequence as a shellcode function and runs it once via
+// the existing one-shot RPC, which executes it on a fresh page AS THE GUEST. So
+// callers patch `.text` through `write_code` and the patch actually takes hold.
+
+/// Per-pid cache of (VirtualProtect, FlushInstructionCache) addresses in the
+/// target's kernel32, resolved from its export table once (the scan is the slow
+/// part; the addresses are stable per process).
+#[cfg(target_os = "macos")]
+static WX_FUNCS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u32, (u64, u64)>>,
+> = std::sync::OnceLock::new();
+
+/// Read a NUL-terminated ASCII export name at `addr` (bounded).
+#[cfg(target_os = "macos")]
+fn read_cstr(handle: &SafeHandle, addr: usize) -> MemOpResult<Vec<u8>> {
+    let raw = read_bytes(handle, addr, 64, T)?;
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    Ok(raw[..end].to_vec())
+}
+
+/// Resolve an export by name from a PE module's export directory in the target.
+/// Export names are sorted, so binary-search them (~log2(n) reads).
+#[cfg(target_os = "macos")]
+fn resolve_export(handle: &SafeHandle, base: usize, name: &str) -> MemOpResult<Option<u64>> {
+    let u32_at = |off: usize| -> MemOpResult<u32> {
+        let b = read_bytes(handle, off, 4, T)?;
+        Ok(u32::from_le_bytes(b[..4].try_into().unwrap()))
+    };
+    let e_lfanew = u32_at(base + 0x3C)? as usize;
+    let pe = base + e_lfanew;
+    // PE32+ optional header starts at pe+24; DataDirectory[0] (export) is at +0x70.
+    let exp_rva = u32_at(pe + 24 + 0x70)? as usize;
+    if exp_rva == 0 {
+        return Ok(None);
+    }
+    let ed = base + exp_rva;
+    let hdr = read_bytes(handle, ed, 40, T)?;
+    let num_names = u32::from_le_bytes(hdr[24..28].try_into().unwrap()) as usize;
+    let addr_funcs = base + u32::from_le_bytes(hdr[28..32].try_into().unwrap()) as usize;
+    let addr_names = base + u32::from_le_bytes(hdr[32..36].try_into().unwrap()) as usize;
+    let addr_ords = base + u32::from_le_bytes(hdr[36..40].try_into().unwrap()) as usize;
+    let target = name.as_bytes();
+    let (mut lo, mut hi) = (0usize, num_names);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let nrva = u32_at(addr_names + mid * 4)? as usize;
+        let nm = read_cstr(handle, base + nrva)?;
+        match nm.as_slice().cmp(target) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => {
+                let ob = read_bytes(handle, addr_ords + mid * 2, 2, T)?;
+                let ord = u16::from_le_bytes(ob[..2].try_into().unwrap()) as usize;
+                let frva = u32_at(addr_funcs + ord * 4)? as u64;
+                return Ok(Some(base as u64 + frva));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve + cache kernel32's VirtualProtect and FlushInstructionCache.
+#[cfg(target_os = "macos")]
+fn wx_funcs(handle: &SafeHandle) -> MemOpResult<(u64, u64)> {
+    use crate::process::module::get_named_modules;
+    let pid = {
+        let g = handle.acquire_with_timeout(T).ok_or(MemOpError::Timeout(T))?;
+        g.pid
+    };
+    let cache = WX_FUNCS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(v) = cache.lock().unwrap().get(&pid) {
+        return Ok(*v);
+    }
+    let k32 = get_named_modules(handle, T)?
+        .into_iter()
+        .find(|m| m.name.to_lowercase().ends_with("kernel32.dll"))
+        .ok_or_else(|| MemOpError::Message("kernel32.dll not found in target".into()))?;
+    let vp = resolve_export(handle, k32.base, "VirtualProtect")?
+        .ok_or_else(|| MemOpError::Message("VirtualProtect not exported by kernel32".into()))?;
+    let fic = resolve_export(handle, k32.base, "FlushInstructionCache")?
+        .ok_or_else(|| MemOpError::Message("FlushInstructionCache not exported by kernel32".into()))?;
+    cache.lock().unwrap().insert(pid, (vp, fic));
+    Ok((vp, fic))
+}
+
+/// Win64 shellcode: VirtualProtect(addr,n,PAGE_READWRITE,&old) -> write `bytes` ->
+/// VirtualProtect(addr,n,old,&old2) -> FlushInstructionCache(-1,addr,n). The
+/// RW(non-exec) -> RX toggle is the W^X transition Rosetta re-translates on.
+#[cfg(target_os = "macos")]
+fn build_wx_shellcode(addr: u64, bytes: &[u8], vp: u64, fic: u64) -> Vec<u8> {
+    let n = bytes.len() as u32;
+    let mut c: Vec<u8> = Vec::new();
+    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x48]); // sub rsp,0x48
+    c.extend_from_slice(&[0x48, 0xB9]); // mov rcx, addr
+    c.extend_from_slice(&addr.to_le_bytes());
+    c.push(0xBA); // mov edx, n
+    c.extend_from_slice(&n.to_le_bytes());
+    c.extend_from_slice(&[0x41, 0xB8, 0x04, 0x00, 0x00, 0x00]); // mov r8d, 0x04 PAGE_READWRITE
+    c.extend_from_slice(&[0x4C, 0x8D, 0x4C, 0x24, 0x20]); // lea r9,[rsp+0x20]
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, VirtualProtect
+    c.extend_from_slice(&vp.to_le_bytes());
+    c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, addr
+    c.extend_from_slice(&addr.to_le_bytes());
+    for (i, b) in bytes.iter().enumerate() {
+        c.extend_from_slice(&[0xC6, 0x40, i as u8, *b]); // mov byte [rax+i], b
+    }
+    c.extend_from_slice(&[0x48, 0xB9]); // mov rcx, addr
+    c.extend_from_slice(&addr.to_le_bytes());
+    c.push(0xBA); // mov edx, n
+    c.extend_from_slice(&n.to_le_bytes());
+    c.extend_from_slice(&[0x44, 0x8B, 0x44, 0x24, 0x20]); // mov r8d,[rsp+0x20] (old)
+    c.extend_from_slice(&[0x4C, 0x8D, 0x4C, 0x24, 0x28]); // lea r9,[rsp+0x28]
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, VirtualProtect
+    c.extend_from_slice(&vp.to_le_bytes());
+    c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    c.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rcx,-1
+    c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, addr
+    c.extend_from_slice(&addr.to_le_bytes());
+    c.extend_from_slice(&[0x49, 0xC7, 0xC0]); // mov r8, n (imm32 sign-extended)
+    c.extend_from_slice(&(n as i32).to_le_bytes());
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, FlushInstructionCache
+    c.extend_from_slice(&fic.to_le_bytes());
+    c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x48]); // add rsp,0x48
+    c.push(0xC3); // ret
+    c
+}
+
+/// Write `bytes` into executable target memory so the patch actually takes effect.
+///
+/// On macOS this runs a guest W^X write via the one-shot RPC (see the module note
+/// above). The patch range should be whole and small (≤127 bytes; the page is
+/// briefly non-executable). On Windows/Linux it is a plain memory write.
+#[cfg(target_os = "macos")]
+pub fn write_code(handle: &SafeHandle, addr: usize, bytes: &[u8]) -> MemOpResult<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    if bytes.len() > 127 {
+        return Err(MemOpError::Message(
+            "write_code: patch must be ≤127 bytes (one W^X shellcode call)".into(),
+        ));
+    }
+    let (vp, fic) = wx_funcs(handle)?;
+    let shell = build_wx_shellcode(addr as u64, bytes, vp, fic);
+    let ran = rpc_via_hijack(handle, 0, &shell, 0, 0, Duration::from_secs(5))?;
+    if !ran {
+        return Err(MemOpError::Message(
+            "write_code: guest W^X RPC did not run within timeout".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Plain memory write on non-macOS platforms (no Rosetta translation to invalidate).
+#[cfg(not(target_os = "macos"))]
+pub fn write_code(handle: &SafeHandle, addr: usize, bytes: &[u8]) -> MemOpResult<()> {
+    write_bytes(handle, addr, bytes, T)?;
+    Ok(())
+}
+
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
